@@ -40,6 +40,7 @@ type DownloadUpdate = Omit<Download, "url">;
 type StartedDownload = Pick<Download, "id" | "filename"> & { duplicate: boolean; skipped: boolean };
 type FileExistsPolicy = "rename" | "overwrite" | "skip";
 type DownloadSettings = { maxConcurrentDownloads: number; fileExistsPolicy: FileExistsPolicy };
+type OpenFileOutcome = { confirmationRequired: boolean };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
 
@@ -184,8 +185,11 @@ function App() {
   const [filePolicyError, setFilePolicyError] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingFilePolicy, setIsSavingFilePolicy] = useState(false);
+  const [isExportingDiagnostics, setIsExportingDiagnostics] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ downloadId: string; x: number; y: number } | null>(null);
   const [noticeMessage, setNoticeMessage] = useState("");
+  const [diagnosticsError, setDiagnosticsError] = useState("");
+  const [diagnosticsNotice, setDiagnosticsNotice] = useState("");
   const urlInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
@@ -431,7 +435,7 @@ function App() {
 
   function showContextMenu(downloadId: string, x: number, y: number) {
     const menuWidth = 236;
-    const menuHeight = 280;
+    const menuHeight = 420;
     setContextMenu({
       downloadId,
       x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
@@ -463,9 +467,80 @@ function App() {
     setErrorMessage("");
     setNoticeMessage("");
     try {
-      await invoke("open_download_location", { id: download.id });
+      await invoke("open_containing_folder", { id: download.id });
     } catch (error) {
       setErrorMessage(String(error));
+    }
+  }
+
+  async function openDownloadedFile(download: Download) {
+    setContextMenu(null);
+    setErrorMessage("");
+    try {
+      const outcome = await invoke<OpenFileOutcome>("open_file", {
+        id: download.id,
+        confirmedUnsafe: false,
+      });
+      if (
+        outcome.confirmationRequired &&
+        window.confirm(
+          "This file may be an executable or script. Opening it can run untrusted code. Do you want to continue?",
+        )
+      ) {
+        await invoke<OpenFileOutcome>("open_file", {
+          id: download.id,
+          confirmedUnsafe: true,
+        });
+      }
+    } catch (error) {
+      setErrorMessage(String(error));
+    }
+  }
+
+  async function renameDownload(download: Download) {
+    setContextMenu(null);
+    const filename = window.prompt("Rename download", download.filename)?.trim();
+    if (!filename || filename === download.filename) return;
+    setErrorMessage("");
+    try {
+      await invoke("rename_download", { id: download.id, filename });
+      setDownloads(await invoke<Download[]>("list_downloads"));
+      setNoticeMessage("Download renamed.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    }
+  }
+
+  async function removeDownload(download: Download, deleteFile: boolean) {
+    setContextMenu(null);
+    const description = deleteFile
+      ? `Permanently delete "${download.filename}" and remove it from the list?`
+      : `Remove "${download.filename}" from the list? The downloaded file will be kept.`;
+    if (!window.confirm(description) || busyActionId) return;
+    setBusyActionId(download.id);
+    setErrorMessage("");
+    try {
+      await invoke("remove_from_list", { id: download.id, deleteFile });
+      setDownloads(await invoke<Download[]>("list_downloads"));
+      setNoticeMessage(deleteFile ? "Download file deleted." : "Download removed from the list.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    } finally {
+      setBusyActionId(null);
+    }
+  }
+
+  async function exportDiagnostics() {
+    setIsExportingDiagnostics(true);
+    setDiagnosticsError("");
+    setDiagnosticsNotice("");
+    try {
+      const reportPath = await invoke<string>("export_diagnostics");
+      setDiagnosticsNotice(`Diagnostics report saved to ${reportPath}`);
+    } catch (error) {
+      setDiagnosticsError(String(error));
+    } finally {
+      setIsExportingDiagnostics(false);
     }
   }
 
@@ -634,6 +709,22 @@ function App() {
                   </select>
                 </label>
                 {filePolicyError && <p className="settings-error" role="alert">{filePolicyError}</p>}
+              </section>
+              <section className="settings-card">
+                <div className="settings-copy">
+                  <h2>Diagnostics</h2>
+                  <p>Save a report with app details, settings, and recent redacted logs.</p>
+                </div>
+                {diagnosticsError && <p className="settings-error" role="alert">{diagnosticsError}</p>}
+                {diagnosticsNotice && <p className="settings-note" role="status">{diagnosticsNotice}</p>}
+                <button
+                  className="start-button settings-save"
+                  disabled={isExportingDiagnostics}
+                  onClick={() => void exportDiagnostics()}
+                  type="button"
+                >
+                  {isExportingDiagnostics ? "Exporting…" : "Export diagnostics"}
+                </button>
               </section>
             </>
           ) : (
@@ -904,6 +995,35 @@ function App() {
                           <Icon name="copy" />
                           Copy download link
                         </button>
+                      )}
+                      {download.status === "completed" && (
+                        <button onClick={() => void openDownloadedFile(download)} role="menuitem" type="button">
+                          <Icon name="download" />
+                          Open file
+                        </button>
+                      )}
+                      {["completed", "failed", "cancelled", "link-expired"].includes(download.status) && (
+                        <>
+                          <button onClick={() => void renameDownload(download)} role="menuitem" type="button">
+                            <Icon name="more" />
+                            Rename
+                          </button>
+                          <button onClick={() => void removeDownload(download, false)} role="menuitem" type="button">
+                            <Icon name="cancel" />
+                            Remove from list
+                          </button>
+                          {download.status === "completed" && (
+                            <button
+                              className="danger-menu-item"
+                              onClick={() => void removeDownload(download, true)}
+                              role="menuitem"
+                              type="button"
+                            >
+                              <Icon name="cancel" />
+                              Delete file
+                            </button>
+                          )}
+                        </>
                       )}
                       <button onClick={() => void openDownloadLocation(download)} role="menuitem" type="button">
                         <Icon name="folder" />

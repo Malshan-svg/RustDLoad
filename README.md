@@ -17,13 +17,16 @@ A free, open-source download manager built with Rust and Tauri.
 - Detect stalled responses, preserve durable progress on disk-full errors, and check available disk space before allocating known-size downloads.
 - Mark HTTP 403/410 responses as expired links; supply a replacement URL to resume only when the server size and validator still match.
 - Detect duplicate HTTP/HTTPS URLs before opening the save dialog and report existing downloads to the UI; resolve destination collisions using the configured file-exists policy.
-- Right-click a download to start/resume or pause it, retry it, copy its URL, or open its destination folder.
+- Right-click a download to start/resume or pause it, retry it, copy its URL, open its file or destination folder, rename it, or remove it from the list.
+- Open executable and script downloads only after an explicit warning; completed Windows downloads receive a Mark-of-the-Web zone identifier.
+- Export a diagnostics report with app version, platform, settings, and recent logs with URL credentials and query values redacted.
 - Choose a persistent maximum of 1–10 concurrent downloads (default: 3); additional jobs wait in the queue.
 - Apply limit changes without interrupting running transfers. When lowering the limit, queued jobs wait until the active count is below the new limit.
 - Resume from the saved byte offset when the server supports HTTP Range requests.
 - Use up to four parallel byte-range segments for downloads of at least 2 MiB, writing directly to byte offsets in a preallocated partial file. An atomic `.rdl` sidecar checkpoints each range and validates the final URL, size, and validator before resuming; unsupported or inconsistent ranges restart safely as a sequential download.
 - Persist the queue across restarts, recover interrupted downloads as paused, and validate saved completed files before restoring their completed status.
-- Query the restored queue through the additive `list_downloads` Tauri command.
+- Query the restored queue and per-download response, segment, retry, timestamp, and event details through the `list_downloads` and `get_download_details` Tauri commands.
+- Manage completed or inactive records through validated `rename_download`, `remove_from_list`, `open_file`, and `open_containing_folder` commands.
 
 ## Development
 

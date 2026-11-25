@@ -38,7 +38,12 @@
 - The persisted file-exists setting now supports keeping both files (default), replacing the existing file only after the new transfer is complete, or skipping a destination that already exists. The policy is stored in settings and on each download record so retries/restores retain behavior; legacy settings and queue records default safely to rename.
 - Task 5 validation: URL/header filename normalization, local HTTP filename adoption, checkpoint relocation, existing-file collision handling, overwrite/skip finalization, and settings migration/persistence tests passed. All 59 Rust tests, strict Clippy, formatting/whitespace checks, and the frontend production build passed.
 - Phase 1, task 6 verifies the completed partial file is regular and exactly matches the expected total size before finalizing both sequential and segmented downloads. Responses labeled as HTML/text are rejected for non-text filenames with an explicit error rather than being marked completed; ordinary text filenames remain allowed.
-- Task 6's local HTTP regression now exercises the previously deferred status-200 HTML error through the downloader, not just at the wire level. Focused classification and size-verification tests passed; run the full suite and checks before committing.
+- Task 6's local HTTP regression exercises the previously deferred status-200 HTML error through the downloader, not just at the wire level. Final size and content-type checks are covered by focused tests.
+- Phase 1, task 7 adds `get_download_details` with response metadata, current segment progress, timestamps, retry and connection counts, last error, and a persisted 50-event history. Structured JSON tracing rotates daily under app data. Diagnostics export includes app version, platform, non-secret settings, and the 100 newest log lines; URL user-info, query values, and fragments are redacted. A Settings action exports the report.
+- Diagnostics tests cover detail snapshots, event-history retention, URL redaction, newest-log ordering, and report content.
+- Phase 1, task 8 adds validated rename and removal actions, optional completed-file deletion, default-app opening, and containing-folder opening. Destructive or filesystem actions reject active downloads; rename also moves the resume sidecar and rolls back on persistence errors. Executable and script extensions require an explicit frontend confirmation; URL copying remains frontend-only.
+- Phase 1, task 9 validates download identifiers and URL sizes/schemes, restricts the capability to event listening and the save dialog, and applies a restrictive CSP. Completed Windows downloads receive a `Zone.Identifier` marking them as Internet-originated.
+- Phase 1 completion gate: all 73 Rust tests passed, including Windows Mark-of-the-Web coverage; strict Clippy, Rust formatting, whitespace/config validation, and the frontend production build passed. No live internet downloads were used.
 
 ## Manual test checklist
 
@@ -51,8 +56,11 @@
 - [ ] Test the Settings screen and saved concurrency limit.
 - [ ] Test each file-exists policy against an existing destination and confirm no unintended data loss.
 - [ ] Verify URL-derived and server-provided filenames on Windows with unusual characters and long names.
+- [ ] Rename and remove completed downloads; confirm remove-without-delete preserves the file and delete-file removes it.
+- [ ] Open a downloaded document and confirm executable/script downloads require an additional warning confirmation.
+- [ ] Export diagnostics and verify report contents are useful while signed URL credentials and query values are absent.
 
 ## Known limitations
 
 - Offline recovery is request-driven rather than based on an operating-system network-change event; active transfers detect connection/timeouts, pause as Offline, and retry with backoff.
-- The HTTP 200 HTML-error fixture is covered at the wire level, but classifying that body as an error is part of Phase 1 task 6 and remains pending.
+- Manual desktop smoke tests remain outstanding, including real-server concurrency/range behavior and the new context-menu/diagnostics flows.

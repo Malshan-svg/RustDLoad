@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "windows", target_os = "macos", unix))]
 use std::process::Command;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State};
 use tokio::{
@@ -147,6 +147,47 @@ struct DownloadSnapshot {
     error: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadEvent {
+    timestamp_ms: u64,
+    kind: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentDetail {
+    start: u64,
+    end: u64,
+    position: u64,
+    downloaded_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadDetails {
+    id: String,
+    filename: String,
+    destination: String,
+    url: String,
+    final_url: Option<String>,
+    http_status: Option<u16>,
+    content_type: Option<String>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    segments: Vec<SegmentDetail>,
+    connection_count: usize,
+    retry_count: u32,
+    created_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    resume_supported: Option<bool>,
+    status: String,
+    last_error: Option<String>,
+    events: Vec<DownloadEvent>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StartedDownload {
@@ -184,6 +225,15 @@ struct DownloadEntry {
     validator: Option<String>,
     error: Option<String>,
     retry_count: u32,
+    final_url: Option<String>,
+    http_status: Option<u16>,
+    content_type: Option<String>,
+    connection_count: usize,
+    created_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    resume_supported: Option<bool>,
+    events: VecDeque<DownloadEvent>,
     auto_offline: bool,
     control: watch::Sender<Control>,
     task_lock: Arc<tokio::sync::Mutex<()>>,
@@ -291,6 +341,24 @@ struct PersistedDownload {
     validator: Option<String>,
     #[serde(default)]
     retry_count: u32,
+    #[serde(default)]
+    final_url: Option<String>,
+    #[serde(default)]
+    http_status: Option<u16>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    connection_count: usize,
+    #[serde(default)]
+    created_at_ms: Option<u64>,
+    #[serde(default)]
+    started_at_ms: Option<u64>,
+    #[serde(default)]
+    finished_at_ms: Option<u64>,
+    #[serde(default)]
+    resume_supported: Option<bool>,
+    #[serde(default)]
+    events: VecDeque<DownloadEvent>,
     error: Option<String>,
 }
 
@@ -357,6 +425,25 @@ fn emit_update<S: UpdateSink + ?Sized>(sink: &S, update: DownloadUpdate) {
     sink.emit_download_update(update);
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn push_download_event(entry: &mut DownloadEntry, kind: &str, message: String) {
+    if entry.events.len() == 50 {
+        entry.events.pop_front();
+    }
+    entry.events.push_back(DownloadEvent {
+        timestamp_ms: now_ms(),
+        kind: kind.to_string(),
+        message,
+    });
+}
+
 fn update_entry(
     manager: &DownloadManager,
     id: &str,
@@ -379,12 +466,103 @@ fn update_entry(
         Control::Cancelled if matches!(status, "downloading" | "paused") => "cancelled",
         _ => status,
     };
+    let status_changed = entry.status != status;
+    let error_changed = entry.error != error;
     entry.filename = filename.to_string();
     entry.status = status.to_string();
     entry.downloaded_bytes = downloaded_bytes;
     entry.total_bytes = total_bytes;
     entry.error = error;
+    if status == "downloading" && entry.started_at_ms.is_none() {
+        entry.started_at_ms = Some(now_ms());
+    }
+    if matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "link-expired"
+    ) && entry.finished_at_ms.is_none()
+    {
+        entry.finished_at_ms = Some(now_ms());
+    }
+    if status_changed || error_changed {
+        let message = entry
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("Status changed to {status}."));
+        push_download_event(
+            entry,
+            if entry.error.is_some() {
+                "error"
+            } else {
+                "status"
+            },
+            message,
+        );
+        if status_changed {
+            tracing::info!(
+                download_id = %id,
+                status = %status,
+                downloaded_bytes,
+                total_bytes,
+                "download state changed"
+            );
+        }
+        if entry.error.is_some() {
+            tracing::warn!(
+                download_id = %id,
+                status = %status,
+                "download error recorded"
+            );
+        }
+    }
     Ok(status.to_string())
+}
+
+fn remember_response_details(
+    manager: &DownloadManager,
+    id: &str,
+    final_url: &str,
+    http_status: u16,
+    content_type: Option<&str>,
+    resume_supported: Option<bool>,
+    connection_count: usize,
+) -> Result<(), String> {
+    let mut entries = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?;
+    let entry = entries
+        .get_mut(id)
+        .ok_or_else(|| format!("Download {id} is no longer available."))?;
+    let response_changed = entry.final_url.as_deref() != Some(final_url)
+        || entry.http_status != Some(http_status)
+        || entry.content_type.as_deref() != content_type
+        || resume_supported.is_some_and(|supported| entry.resume_supported != Some(supported));
+    entry.final_url = Some(final_url.to_string());
+    entry.http_status = Some(http_status);
+    if content_type.is_some() {
+        entry.content_type = content_type.map(str::to_string);
+    }
+    if let Some(supported) = resume_supported {
+        entry.resume_supported = Some(supported);
+    }
+    entry.connection_count = entry.connection_count.max(connection_count);
+    if response_changed {
+        push_download_event(
+            entry,
+            "response",
+            format!("Received HTTP {http_status} response."),
+        );
+    }
+    tracing::info!(
+        download_id = %id,
+        http_status,
+        content_type = content_type.unwrap_or("unknown"),
+        resume_supported = ?resume_supported,
+        connection_count = entry.connection_count,
+        "download response received"
+    );
+    drop(entries);
+    manager.persist()
 }
 
 impl DownloadManager {
@@ -415,6 +593,15 @@ impl DownloadManager {
                     total_bytes: entry.total_bytes,
                     validator: entry.validator.clone(),
                     retry_count: entry.retry_count,
+                    final_url: entry.final_url.clone(),
+                    http_status: entry.http_status,
+                    content_type: entry.content_type.clone(),
+                    connection_count: entry.connection_count,
+                    created_at_ms: entry.created_at_ms,
+                    started_at_ms: entry.started_at_ms,
+                    finished_at_ms: entry.finished_at_ms,
+                    resume_supported: entry.resume_supported,
+                    events: entry.events.clone(),
                     error: entry.error.clone(),
                 })
                 .collect()
@@ -520,6 +707,150 @@ fn persist_max_concurrent_downloads(path: &Path, limit: usize) -> Result<(), Str
         .map(|settings| settings.file_exists_policy)
         .unwrap_or_default();
     persist_download_settings(path, limit, file_exists_policy)
+}
+
+struct TracingLogGuard {
+    _guard: Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+}
+
+fn init_tracing(app_data_dir: &Path) -> Result<TracingLogGuard, String> {
+    let log_dir = app_data_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|error| format!("Could not create the log folder: {error}"))?;
+    let appender = tracing_appender::rolling::daily(&log_dir, "rustdload.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(writer)
+        .try_init()
+        .map_err(|error| format!("Could not initialize structured logging: {error}"))?;
+    Ok(TracingLogGuard {
+        _guard: Mutex::new(Some(guard)),
+    })
+}
+
+fn recent_log_lines(log_dir: &Path, max_lines: usize) -> Result<Vec<String>, String> {
+    if !log_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(log_dir)
+        .map_err(|error| format!("Could not read the log folder: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Could not read a log folder entry: {error}"))?;
+        if entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect a log file: {error}"))?
+            .is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rustdload.log")
+        {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+
+    let mut lines = VecDeque::new();
+    for path in files.iter().rev() {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|error| format!("Could not read a log file: {error}"))?;
+        for line in contents.lines().rev() {
+            lines.push_back(redact_diagnostic_urls(line));
+            if lines.len() > max_lines {
+                lines.pop_back();
+            }
+        }
+        if lines.len() == max_lines {
+            break;
+        }
+    }
+    Ok(lines.into_iter().rev().collect())
+}
+
+fn redact_diagnostic_urls(line: &str) -> String {
+    let mut redacted = String::new();
+    let mut offset = 0;
+    while offset < line.len() {
+        let remaining = &line[offset..];
+        let scheme_len = if remaining.starts_with("https://") {
+            8
+        } else if remaining.starts_with("http://") {
+            7
+        } else {
+            let character = remaining.chars().next().unwrap();
+            redacted.push(character);
+            offset += character.len_utf8();
+            continue;
+        };
+        let end = remaining
+            .char_indices()
+            .skip_while(|(index, _)| *index < scheme_len)
+            .find(|(_, character)| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | ',' | '}' | ']' | ')' | '\\')
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        redacted.push_str(&redact_url(&remaining[..end]));
+        offset += end;
+    }
+    redacted
+}
+
+fn redact_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let path_and_query = &remainder[authority_end..];
+    let sensitive_start = path_and_query
+        .find(['?', '#'])
+        .unwrap_or(path_and_query.len());
+    let safe_path = &path_and_query[..sensitive_start];
+    let sensitive_suffix = &path_and_query[sensitive_start..];
+    format!(
+        "{scheme}://{host}{safe_path}{}",
+        if sensitive_suffix.is_empty() {
+            String::new()
+        } else {
+            format!("{}[REDACTED]", &sensitive_suffix[..1])
+        }
+    )
+}
+
+fn write_diagnostics_report(
+    app_data_dir: &Path,
+    max_concurrent_downloads: usize,
+    file_exists_policy: FileExistsPolicy,
+) -> Result<PathBuf, String> {
+    let log_lines = recent_log_lines(&app_data_dir.join("logs"), 100)?;
+    let report_dir = app_data_dir.join("diagnostics");
+    std::fs::create_dir_all(&report_dir)
+        .map_err(|error| format!("Could not create the diagnostics folder: {error}"))?;
+    let report_path = report_dir.join(format!("rustdload-diagnostics-{}.txt", now_ms()));
+    let mut report = format!(
+        "RustDLoad diagnostics\nVersion: {}\nOS: {}\nSettings:\n  maxConcurrentDownloads: {}\n  fileExistsPolicy: {:?}\nRecent log lines ({}):\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        max_concurrent_downloads,
+        file_exists_policy,
+        log_lines.len()
+    );
+    for line in log_lines {
+        report.push_str(&line);
+        report.push('\n');
+    }
+    std::fs::write(&report_path, report)
+        .map_err(|error| format!("Could not write the diagnostics report: {error}"))?;
+    Ok(report_path)
 }
 
 fn restore_download_manager(
@@ -713,6 +1044,15 @@ fn restore_download_manager(
                     validator: record.validator.clone(),
                     error: record.error.clone(),
                     retry_count: record.retry_count,
+                    final_url: record.final_url.clone(),
+                    http_status: record.http_status,
+                    content_type: record.content_type.clone(),
+                    connection_count: record.connection_count,
+                    created_at_ms: record.created_at_ms,
+                    started_at_ms: record.started_at_ms,
+                    finished_at_ms: record.finished_at_ms,
+                    resume_supported: record.resume_supported,
+                    events: record.events.clone(),
                     auto_offline: false,
                     control: sender,
                     task_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1218,11 +1558,22 @@ fn filename_is_url_suggestion(filename: &str, suggested: &str) -> bool {
 
 fn parse_http_download_url(value: &str) -> Result<reqwest::Url, String> {
     let mut url = reqwest::Url::parse(value).map_err(|error| error.to_string())?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if value.len() > 8192 {
+        return Err("Download links must be 8192 characters or fewer.".to_string());
+    }
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err("Only HTTP and HTTPS download links are supported.".to_string());
     }
     url.set_fragment(None);
     Ok(url)
+}
+
+fn validate_download_id(id: &str) -> Result<(), String> {
+    let parsed = Uuid::parse_str(id).map_err(|_| "Invalid download identifier.".to_string())?;
+    if parsed.to_string() != id {
+        return Err("Invalid download identifier.".to_string());
+    }
+    Ok(())
 }
 
 fn duplicate_download(
@@ -1764,6 +2115,17 @@ async fn wait_before_retry<S: UpdateSink + ?Sized>(
         let detail = if offline { "Offline" } else { message };
         format!("{detail}. Retrying in {delay_label} (attempt {attempt}/{MAX_NETWORK_RETRIES}).")
     };
+    if let Ok(mut entries) = manager.entries.lock()
+        && let Some(entry) = entries.get_mut(id)
+    {
+        push_download_event(entry, "retry", description.clone());
+    }
+    tracing::warn!(
+        download_id = %id,
+        attempt,
+        offline,
+        "download retry scheduled"
+    );
     publish_update!(
         app,
         manager,
@@ -1920,6 +2282,24 @@ async fn finalize_file_with_policy(
                 )),
             };
         }
+        if let Err(error) = mark_of_the_web(destination) {
+            let rollback_error = tokio::fs::remove_file(destination).await.err();
+            let restore_error = tokio::fs::rename(&backup, destination).await.err();
+            return Err(format!(
+                "Could not mark the downloaded file as originating from the Internet: {error}{}{}",
+                rollback_error
+                    .map(|error| format!("; could not remove the replacement ({error})"))
+                    .unwrap_or_default(),
+                restore_error
+                    .map(|error| {
+                        format!(
+                            "; the previous file remains at {} ({error})",
+                            backup.display()
+                        )
+                    })
+                    .unwrap_or_default()
+            ));
+        }
         if let Err(error) = tokio::fs::remove_file(partial_path).await {
             if let Err(rollback_error) = tokio::fs::remove_file(destination).await {
                 return Err(format!(
@@ -1954,9 +2334,30 @@ async fn finalize_file_with_policy(
                 format!("Could not finalize the download: {error}")
             }
         })?;
+    if let Err(error) = mark_of_the_web(destination) {
+        let rollback_error = tokio::fs::remove_file(destination).await.err();
+        return Err(format!(
+            "Could not mark the downloaded file as originating from the Internet: {error}{}",
+            rollback_error
+                .map(|error| format!("; could not remove the unmarked destination ({error})"))
+                .unwrap_or_default()
+        ));
+    }
     tokio::fs::remove_file(partial_path)
         .await
         .map_err(|error| format!("Could not finalize the download: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn mark_of_the_web(path: &Path) -> Result<(), String> {
+    let zone_identifier = PathBuf::from(format!("{}:Zone.Identifier", path.display()));
+    std::fs::write(zone_identifier, "[ZoneTransfer]\r\nZoneId=3\r\n")
+        .map_err(|error| format!("Could not write the download origin marker: {error}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn mark_of_the_web(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 async fn verify_download_size(path: &Path, expected: Option<u64>) -> Result<u64, String> {
@@ -2062,11 +2463,25 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
         }
     };
 
+    let response_final_url = response.url().to_string();
+    let response_status = response.status();
     let response_content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    if let Some(error) = text_response_error(&filename, response_content_type) {
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if let Err(error) = remember_response_details(
+        &manager,
+        &id,
+        &response_final_url,
+        response_status.as_u16(),
+        response_content_type.as_deref(),
+        Some(true),
+        1,
+    ) {
+        return SegmentWorkerResult::Failed(error);
+    }
+    if let Some(error) = text_response_error(&filename, response_content_type.as_deref()) {
         return SegmentWorkerResult::Failed(error);
     }
 
@@ -2425,16 +2840,32 @@ async fn try_segmented_download(
     let response_content_type = probe
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    if let Some(error) = text_response_error(filename, response_content_type) {
-        return Err(error);
-    }
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let probe_range = probe
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range);
     let final_url = probe.url().to_string();
+    let resume_supported = probe_status == reqwest::StatusCode::PARTIAL_CONTENT
+        && matches!(probe_range, Some((0, 0, _)));
+    remember_response_details(
+        manager,
+        id,
+        &final_url,
+        probe_status.as_u16(),
+        response_content_type.as_deref(),
+        Some(resume_supported),
+        1,
+    )?;
+    if matches!(
+        probe_status,
+        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
+    ) && let Some(error) = text_response_error(filename, response_content_type.as_deref())
+    {
+        return Err(error);
+    }
     let Some((0, 0, total)) = probe_range else {
         if sidecar_path.exists() {
             create_preallocated_partial(path, 0).await?;
@@ -2520,6 +2951,21 @@ async fn try_segmented_download(
         create_preallocated_partial(path, total).await?;
         state
     };
+    let active_connections = state
+        .segments
+        .iter()
+        .filter(|segment| segment.position <= segment.end)
+        .count()
+        .max(1);
+    remember_response_details(
+        manager,
+        id,
+        &final_url,
+        probe_status.as_u16(),
+        response_content_type.as_deref(),
+        Some(true),
+        active_connections,
+    )?;
     let tracker = SegmentResumeTracker {
         state: Arc::new(tokio::sync::Mutex::new(state.clone())),
         path: sidecar_path.to_path_buf(),
@@ -3098,6 +3544,36 @@ async fn download_file_inner(
             }
         };
 
+        let response_final_url = response.url().to_string();
+        let response_status = response.status();
+        let response_content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if let Err(error) = remember_response_details(
+            &manager,
+            &id,
+            &response_final_url,
+            response_status.as_u16(),
+            response_content_type.as_deref(),
+            None,
+            1,
+        ) {
+            finish_failed!(
+                &app,
+                &manager,
+                &id,
+                &filename,
+                &path,
+                offset,
+                total_bytes,
+                error,
+            )
+            .await;
+            return;
+        }
+
         if can_resume && status_is_range_not_satisfiable(&response) {
             drop(response);
             if let Err(error) = tokio::fs::File::create(&path).await {
@@ -3183,11 +3659,7 @@ async fn download_file_inner(
                 }
             }
         }
-        let response_content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        if let Some(error) = text_response_error(&filename, response_content_type) {
+        if let Some(error) = text_response_error(&filename, response_content_type.as_deref()) {
             finish_failed!(
                 &app,
                 &manager,
@@ -3835,6 +4307,15 @@ async fn start_download(
                 validator: None,
                 error: None,
                 retry_count: 0,
+                final_url: None,
+                http_status: None,
+                content_type: None,
+                connection_count: 0,
+                created_at_ms: Some(now_ms()),
+                started_at_ms: None,
+                finished_at_ms: None,
+                resume_supported: None,
+                events: VecDeque::new(),
                 auto_offline: false,
                 control: sender,
                 task_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3887,12 +4368,74 @@ fn list_downloads(manager: State<'_, DownloadManager>) -> Result<Vec<DownloadSna
     Ok(downloads)
 }
 
+fn download_details(manager: &DownloadManager, id: &str) -> Result<DownloadDetails, String> {
+    let (destination, details) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        let details = DownloadDetails {
+            id: id.to_string(),
+            filename: entry.filename.clone(),
+            destination: entry.destination.to_string_lossy().into_owned(),
+            url: entry.url.clone(),
+            final_url: entry.final_url.clone(),
+            http_status: entry.http_status,
+            content_type: entry.content_type.clone(),
+            downloaded_bytes: entry.downloaded_bytes,
+            total_bytes: entry.total_bytes,
+            segments: Vec::new(),
+            connection_count: entry.connection_count,
+            retry_count: entry.retry_count,
+            created_at_ms: entry.created_at_ms,
+            started_at_ms: entry.started_at_ms,
+            finished_at_ms: entry.finished_at_ms,
+            resume_supported: entry.resume_supported,
+            status: entry.status.clone(),
+            last_error: entry.error.clone(),
+            events: entry.events.iter().cloned().collect(),
+        };
+        (entry.destination.clone(), details)
+    };
+    let segments = read_segment_resume_state(&segment_sidecar_path(&destination))?
+        .map(|state| {
+            state
+                .segments
+                .into_iter()
+                .map(|segment| SegmentDetail {
+                    start: segment.start,
+                    end: segment.end,
+                    position: segment.position,
+                    downloaded_bytes: segment.position.saturating_sub(segment.start),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(DownloadDetails {
+        segments,
+        ..details
+    })
+}
+
+#[tauri::command]
+fn get_download_details(
+    manager: State<'_, DownloadManager>,
+    id: String,
+) -> Result<DownloadDetails, String> {
+    validate_download_id(&id)?;
+    download_details(&manager, &id)
+}
+
 #[tauri::command]
 fn pause_download(
     app: AppHandle,
     manager: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
+    validate_download_id(&id)?;
     control_download(&app, &manager, &id, Control::Paused, "paused")
 }
 
@@ -3902,6 +4445,7 @@ fn resume_download(
     manager: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
+    validate_download_id(&id)?;
     control_download(&app, &manager, &id, Control::Running, "queued")
 }
 
@@ -3911,6 +4455,7 @@ fn cancel_download(
     manager: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
+    validate_download_id(&id)?;
     control_download(&app, &manager, &id, Control::Cancelled, "cancelled")
 }
 
@@ -4154,6 +4699,7 @@ async fn retry_download(
     manager: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
+    validate_download_id(&id)?;
     let manager = manager.inner().clone();
     let task_lock = {
         let entries = manager
@@ -4202,6 +4748,7 @@ async fn update_download_url(
     id: String,
     new_url: String,
 ) -> Result<(), String> {
+    validate_download_id(&id)?;
     let manager = manager.inner().clone();
     let task_lock = {
         let entries = manager
@@ -4253,20 +4800,15 @@ async fn update_download_url(
 
 #[tauri::command]
 fn open_download_location(manager: State<'_, DownloadManager>, id: String) -> Result<(), String> {
-    let directory = {
-        let entries = manager
-            .entries
-            .lock()
-            .map_err(|_| "Download state is unavailable.".to_string())?;
-        let entry = entries
-            .get(&id)
-            .ok_or_else(|| format!("Download {id} was not found."))?;
-        entry
-            .destination
-            .parent()
-            .ok_or_else(|| "The download has no parent folder.".to_string())?
-            .to_path_buf()
-    };
+    open_containing_folder_inner(&manager, &id)
+}
+
+fn open_containing_folder_inner(manager: &DownloadManager, id: &str) -> Result<(), String> {
+    validate_download_id(id)?;
+    let directory = download_destination(manager, id)?
+        .parent()
+        .ok_or_else(|| "The download has no parent folder.".to_string())?
+        .to_path_buf();
     if !directory.is_dir() {
         return Err(format!(
             "The download folder does not exist: {}",
@@ -4274,19 +4816,325 @@ fn open_download_location(manager: State<'_, DownloadManager>, id: String) -> Re
         ));
     }
 
+    open_with_default_app(&directory)
+}
+
+fn download_destination(manager: &DownloadManager, id: &str) -> Result<PathBuf, String> {
+    manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?
+        .get(id)
+        .map(|entry| entry.destination.clone())
+        .ok_or_else(|| format!("Download {id} was not found."))
+}
+
+fn open_with_default_app(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let result = Command::new("explorer.exe").arg(&directory).spawn();
+    let result = Command::new("explorer.exe").arg(path).spawn();
     #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(&directory).spawn();
+    let result = Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(&directory).spawn();
+    let result = Command::new("xdg-open").arg(path).spawn();
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-    return Err("Opening the download folder is not supported on this platform.".to_string());
+    return Err("Opening files or folders is not supported on this platform.".to_string());
 
     #[cfg(any(target_os = "windows", target_os = "macos", unix))]
     result
         .map(|_| ())
-        .map_err(|error| format!("Could not open the download folder: {error}"))
+        .map_err(|error| format!("Could not open the requested path: {error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenFileOutcome {
+    confirmation_required: bool,
+}
+
+fn requires_open_confirmation(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "exe"
+                    | "com"
+                    | "bat"
+                    | "cmd"
+                    | "msi"
+                    | "msp"
+                    | "scr"
+                    | "sh"
+                    | "bash"
+                    | "py"
+                    | "pyw"
+                    | "rb"
+                    | "pl"
+                    | "php"
+                    | "lua"
+                    | "jar"
+                    | "desktop"
+                    | "ps1"
+                    | "psm1"
+                    | "vbs"
+                    | "vbe"
+                    | "js"
+                    | "jse"
+                    | "wsf"
+                    | "wsh"
+                    | "hta"
+                    | "reg"
+                    | "lnk"
+                    | "html"
+                    | "htm"
+                    | "svg"
+            )
+        })
+}
+
+#[tauri::command]
+fn open_file(
+    manager: State<'_, DownloadManager>,
+    id: String,
+    confirmed_unsafe: bool,
+) -> Result<OpenFileOutcome, String> {
+    validate_download_id(&id)?;
+    let path = download_destination(&manager, &id)?;
+    if !path.is_file() {
+        return Err("The downloaded file does not exist.".to_string());
+    }
+    let confirmation_required = requires_open_confirmation(&path);
+    if confirmation_required && !confirmed_unsafe {
+        return Ok(OpenFileOutcome {
+            confirmation_required: true,
+        });
+    }
+    open_with_default_app(&path)?;
+    Ok(OpenFileOutcome {
+        confirmation_required: false,
+    })
+}
+
+#[tauri::command]
+fn open_containing_folder(manager: State<'_, DownloadManager>, id: String) -> Result<(), String> {
+    open_containing_folder_inner(&manager, &id)
+}
+
+#[tauri::command]
+fn rename_download(
+    manager: State<'_, DownloadManager>,
+    id: String,
+    filename: String,
+) -> Result<(), String> {
+    rename_download_inner(&manager, &id, &filename)
+}
+
+fn rename_download_inner(
+    manager: &DownloadManager,
+    id: &str,
+    filename: &str,
+) -> Result<(), String> {
+    validate_download_id(id)?;
+    let filename = filename.trim();
+    if filename.is_empty() || sanitize_filename(filename) != filename {
+        return Err(
+            "Choose a valid filename without path separators or reserved characters.".into(),
+        );
+    }
+
+    let (old_destination, old_filename, old_events, task_lock) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if !matches!(
+            entry.status.as_str(),
+            "completed" | "failed" | "cancelled" | "link-expired"
+        ) {
+            return Err("Pause or finish the download before renaming it.".to_string());
+        }
+        (
+            entry.destination.clone(),
+            entry.filename.clone(),
+            entry.events.clone(),
+            entry.task_lock.clone(),
+        )
+    };
+    if old_filename == filename {
+        return Ok(());
+    }
+    let _task_guard = task_lock
+        .try_lock()
+        .map_err(|_| "The download is busy; try renaming it again shortly.".to_string())?;
+    let new_destination = old_destination.with_file_name(filename);
+    if new_destination.exists() {
+        return Err(format!(
+            "A file already exists with that name: {}",
+            new_destination.display()
+        ));
+    }
+    if old_destination.exists() && !old_destination.is_file() {
+        return Err("The download destination is not a regular file.".into());
+    }
+    let old_sidecar = segment_sidecar_path(&old_destination);
+    let new_sidecar = segment_sidecar_path(&new_destination);
+    if old_sidecar.exists() && new_sidecar.exists() {
+        return Err("A resume record already exists for that filename.".into());
+    }
+
+    let moved_file = old_destination.exists();
+    if moved_file {
+        std::fs::rename(&old_destination, &new_destination)
+            .map_err(|error| format!("Could not rename the downloaded file: {error}"))?;
+    }
+    let moved_sidecar = old_sidecar.exists();
+    if moved_sidecar && let Err(error) = std::fs::rename(&old_sidecar, &new_sidecar) {
+        let rollback_error = moved_file
+            .then(|| std::fs::rename(&new_destination, &old_destination).err())
+            .flatten();
+        return Err(format!(
+            "Could not rename the resume record: {error}{}",
+            rollback_error
+                .map(|error| format!("; could not restore the downloaded file ({error})"))
+                .unwrap_or_default()
+        ));
+    }
+
+    {
+        let mut entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        entry.destination = new_destination.clone();
+        entry.filename = filename.to_string();
+        push_download_event(entry, "rename", format!("Renamed to {filename}."));
+    }
+    if let Err(error) = manager.persist() {
+        let mut rollback_errors = Vec::new();
+        match manager.entries.lock() {
+            Ok(mut entries) => {
+                if let Some(entry) = entries.get_mut(id) {
+                    entry.destination = old_destination.clone();
+                    entry.filename = old_filename;
+                    entry.events = old_events;
+                }
+            }
+            Err(_) => rollback_errors.push("download state is unavailable".to_string()),
+        }
+        if moved_sidecar && let Err(rollback_error) = std::fs::rename(&new_sidecar, &old_sidecar) {
+            rollback_errors.push(format!(
+                "could not restore the resume record: {rollback_error}"
+            ));
+        }
+        if moved_file
+            && let Err(rollback_error) = std::fs::rename(&new_destination, &old_destination)
+        {
+            rollback_errors.push(format!(
+                "could not restore the downloaded file: {rollback_error}"
+            ));
+        }
+        return Err(if rollback_errors.is_empty() {
+            error
+        } else {
+            format!("{error}; rollback issues: {}", rollback_errors.join("; "))
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_from_list(
+    manager: State<'_, DownloadManager>,
+    id: String,
+    delete_file: bool,
+) -> Result<(), String> {
+    remove_from_list_inner(&manager, &id, delete_file)
+}
+
+fn remove_from_list_inner(
+    manager: &DownloadManager,
+    id: &str,
+    delete_file: bool,
+) -> Result<(), String> {
+    validate_download_id(id)?;
+    let (destination, status, task_lock) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if matches!(entry.status.as_str(), "downloading" | "queued" | "paused") {
+            return Err("Cancel or finish the download before removing it from the list.".into());
+        }
+        (
+            entry.destination.clone(),
+            entry.status.clone(),
+            entry.task_lock.clone(),
+        )
+    };
+    let _task_guard = task_lock
+        .try_lock()
+        .map_err(|_| "The download is busy; try removing it again shortly.".to_string())?;
+    if delete_file && destination.exists() && !destination.is_file() {
+        return Err("The download destination is not a regular file.".into());
+    }
+
+    let removed = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?
+        .remove(id)
+        .ok_or_else(|| format!("Download {id} was not found."))?;
+    if let Err(error) = manager.persist() {
+        manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?
+            .insert(id.to_string(), removed);
+        return Err(error);
+    }
+    let cleanup = [
+        partial_path_for(&destination, id),
+        segment_sidecar_path(&destination),
+    ];
+    let cleanup_result = (|| {
+        for path in cleanup {
+            if path.is_file() {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!("Could not remove temporary download data: {error}")
+                })?;
+            }
+        }
+        if delete_file && destination.is_file() {
+            std::fs::remove_file(&destination)
+                .map_err(|error| format!("Could not delete the downloaded file: {error}"))?;
+        }
+        Ok(())
+    })();
+    if let Err(cleanup_error) = cleanup_result {
+        manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?
+            .insert(id.to_string(), removed);
+        if let Err(persist_error) = manager.persist() {
+            return Err(format!(
+                "{cleanup_error}; could not restore the queue record: {persist_error}"
+            ));
+        }
+        return Err(cleanup_error);
+    }
+    tracing::info!(download_id = %id, status = %status, delete_file, "download removed from list");
+    Ok(())
 }
 
 #[tauri::command]
@@ -4338,30 +5186,52 @@ fn set_file_exists_policy(
     })
 }
 
+#[tauri::command]
+fn export_diagnostics(manager: State<'_, DownloadManager>) -> Result<String, String> {
+    let app_data_dir = manager
+        .persistence_file
+        .as_deref()
+        .and_then(Path::parent)
+        .ok_or_else(|| "The application data folder is unavailable.".to_string())?;
+    let report_path = write_diagnostics_report(
+        app_data_dir,
+        manager.admission.limit()?,
+        manager.admission.file_exists_policy()?,
+    )?;
+    Ok(report_path.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::mark_of_the_web;
     use super::{
         Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadFailure,
         DownloadManager, DownloadUpdate, FileExistsPolicy, MAX_FILENAME_UTF16_UNITS,
         PersistedDownload, PersistedSettings, RetryContext, RetryResult, SEGMENT_RESUME_VERSION,
         SegmentPosition, SegmentResumeState, SlotResult, UpdateSink, acquire_download_slot,
-        apply_response_filename, clear_stale_segment_sidecar, download_file_inner,
-        duplicate_download, enough_disk_space, ensure_destination_available, ensure_disk_space,
-        filename_from_content_disposition, filename_from_url, finalize_file,
-        finalize_file_with_policy, finish_failed, is_reserved_windows_name, numbered_filename,
-        parse_content_range, parse_http_download_url, partial_path_for, pause_active_downloads,
-        persist_download_settings, persist_max_concurrent_downloads, persist_segment_resume_state,
-        persist_snapshot, prepare_download_retry, prepare_download_url_update,
-        read_download_settings, read_max_concurrent_downloads, read_persisted_queue,
-        read_segment_resume_state, reconcile_persisted_status, restore_download_manager,
-        sanitize_filename, segment_progress, segment_ranges, segment_sidecar_path,
-        suggested_destination, text_response_error, valid_range_probe, valid_segment_response,
-        valid_segment_resume_state, validate_max_concurrent_downloads, validate_transition,
-        validators_compatible, verify_download_size, wait_before_retry,
+        apply_response_filename, clear_stale_segment_sidecar, download_details,
+        download_file_inner, duplicate_download, enough_disk_space, ensure_destination_available,
+        ensure_disk_space, filename_from_content_disposition, filename_from_url, finalize_file,
+        finalize_file_with_policy, finish_failed, is_reserved_windows_name, now_ms,
+        numbered_filename, parse_content_range, parse_http_download_url, partial_path_for,
+        pause_active_downloads, persist_download_settings, persist_max_concurrent_downloads,
+        persist_segment_resume_state, persist_snapshot, prepare_download_retry,
+        prepare_download_url_update, push_download_event, read_download_settings,
+        read_max_concurrent_downloads, read_persisted_queue, read_segment_resume_state,
+        recent_log_lines, reconcile_persisted_status, redact_diagnostic_urls,
+        remove_from_list_inner, rename_download_inner, requires_open_confirmation,
+        restore_download_manager, sanitize_filename, segment_progress, segment_ranges,
+        segment_sidecar_path, suggested_destination, text_response_error, valid_range_probe,
+        valid_segment_response, valid_segment_resume_state, validate_download_id,
+        validate_max_concurrent_downloads, validate_transition, validators_compatible,
+        verify_download_size, wait_before_retry, write_diagnostics_report,
     };
     use std::{
+        collections::VecDeque,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        path::Path,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -4697,6 +5567,15 @@ mod tests {
                     validator: None,
                     error: None,
                     retry_count: 0,
+                    final_url: None,
+                    http_status: None,
+                    content_type: None,
+                    connection_count: 0,
+                    created_at_ms: Some(now_ms()),
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                    resume_supported: None,
+                    events: VecDeque::new(),
                     auto_offline: false,
                     control: control_sender.clone(),
                     task_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -4732,6 +5611,272 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn download_details_include_current_response_and_retry_metadata() {
+        let test_download = TestDownload::new();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = "https://example.com/file.bin".to_string();
+            entry.final_url = Some("https://cdn.example.com/file.bin".to_string());
+            entry.http_status = Some(206);
+            entry.content_type = Some("application/octet-stream".to_string());
+            entry.downloaded_bytes = 12;
+            entry.total_bytes = Some(100);
+            entry.connection_count = 4;
+            entry.retry_count = 2;
+            entry.started_at_ms = Some(20);
+            entry.resume_supported = Some(true);
+            entry.error = Some("last transfer error".to_string());
+            push_download_event(entry, "retry", "Retrying transfer.".to_string());
+        }
+        let resume_state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: "https://example.com/file.bin".to_string(),
+            final_url: "https://cdn.example.com/file.bin".to_string(),
+            total_size: 10,
+            validator: None,
+            segments: vec![
+                SegmentPosition {
+                    start: 0,
+                    end: 4,
+                    position: 3,
+                },
+                SegmentPosition {
+                    start: 5,
+                    end: 9,
+                    position: 5,
+                },
+            ],
+        };
+        std::fs::write(
+            super::segment_sidecar_path(&test_download.final_path),
+            serde_json::to_vec(&resume_state).unwrap(),
+        )
+        .unwrap();
+
+        let details = download_details(&test_download.manager, &test_download.id).unwrap();
+        assert_eq!(details.url, "https://example.com/file.bin");
+        assert_eq!(
+            details.final_url.as_deref(),
+            Some("https://cdn.example.com/file.bin")
+        );
+        assert_eq!(details.http_status, Some(206));
+        assert_eq!(
+            details.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(details.downloaded_bytes, 12);
+        assert_eq!(details.total_bytes, Some(100));
+        assert_eq!(details.connection_count, 4);
+        assert_eq!(details.retry_count, 2);
+        assert_eq!(details.started_at_ms, Some(20));
+        assert_eq!(details.resume_supported, Some(true));
+        assert_eq!(details.last_error.as_deref(), Some("last transfer error"));
+        assert_eq!(details.events.len(), 1);
+        assert_eq!(details.events[0].kind, "retry");
+        assert_eq!(details.segments.len(), 2);
+        assert_eq!(details.segments[0].downloaded_bytes, 3);
+        assert_eq!(details.segments[1].downloaded_bytes, 0);
+    }
+
+    #[test]
+    fn download_event_history_retains_only_the_latest_fifty_events() {
+        let test_download = TestDownload::new();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            for index in 0..55 {
+                push_download_event(entry, "test", index.to_string());
+            }
+        }
+
+        let details = download_details(&test_download.manager, &test_download.id).unwrap();
+        assert_eq!(details.events.len(), 50);
+        assert_eq!(details.events.first().unwrap().message, "5");
+        assert_eq!(details.events.last().unwrap().message, "54");
+    }
+
+    #[test]
+    fn diagnostics_redact_url_credentials_and_query_values() {
+        let redacted = redact_diagnostic_urls(
+            r#"request to https://user:password@example.com/download?token=secret"#,
+        );
+        assert_eq!(
+            redacted,
+            "request to https://example.com/download?[REDACTED]"
+        );
+        let redacted_without_path =
+            redact_diagnostic_urls("request to https://example.com?token=secret");
+        assert_eq!(
+            redacted_without_path,
+            "request to https://example.com?[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn diagnostics_keep_the_newest_log_lines_in_chronological_order() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustdload-recent-logs-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("rustdload.log"),
+            "first\nsecond\nthird\nfourth\n",
+        )
+        .unwrap();
+
+        let lines = recent_log_lines(&directory, 2).unwrap();
+        assert_eq!(lines, vec!["third", "fourth"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn diagnostics_export_includes_settings_and_redacted_recent_logs() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustdload-diagnostics-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let logs = directory.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("rustdload.log"),
+            r#"{"message":"request https://user:password@example.com/file?signature=secret"}"#,
+        )
+        .unwrap();
+
+        let report_path =
+            write_diagnostics_report(&directory, 4, FileExistsPolicy::Overwrite).unwrap();
+        let report = std::fs::read_to_string(report_path).unwrap();
+        assert!(report.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION"))));
+        assert!(report.contains(&format!("OS: {}", std::env::consts::OS)));
+        assert!(report.contains("maxConcurrentDownloads: 4"));
+        assert!(report.contains("fileExistsPolicy: Overwrite"));
+        assert!(report.contains("https://example.com/file?[REDACTED]"));
+        assert!(!report.contains("password"));
+        assert!(!report.contains("signature=secret"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rename_download_moves_file_and_resume_record_without_leaving_folder() {
+        let test_download = TestDownload::new();
+        let old_sidecar = super::segment_sidecar_path(&test_download.final_path);
+        std::fs::write(&test_download.final_path, b"downloaded").unwrap();
+        std::fs::write(&old_sidecar, b"resume").unwrap();
+        test_download
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&test_download.id)
+            .unwrap()
+            .status = "completed".to_string();
+
+        rename_download_inner(&test_download.manager, &test_download.id, "renamed.bin").unwrap();
+
+        let renamed = test_download.directory.join("renamed.bin");
+        assert!(!test_download.final_path.exists());
+        assert_eq!(std::fs::read(&renamed).unwrap(), b"downloaded");
+        assert_eq!(
+            std::fs::read(super::segment_sidecar_path(&renamed)).unwrap(),
+            b"resume"
+        );
+        let details = download_details(&test_download.manager, &test_download.id).unwrap();
+        assert_eq!(details.filename, "renamed.bin");
+        assert_eq!(details.destination, renamed.to_string_lossy());
+    }
+
+    #[test]
+    fn rename_download_rejects_traversal_and_active_transfers() {
+        let test_download = TestDownload::new();
+        assert!(
+            rename_download_inner(&test_download.manager, &test_download.id, "..\\escape.exe")
+                .is_err()
+        );
+        test_download
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&test_download.id)
+            .unwrap()
+            .status = "downloading".to_string();
+        assert!(
+            rename_download_inner(&test_download.manager, &test_download.id, "renamed.bin")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_download_preserves_or_deletes_destination_as_requested() {
+        let preserve = TestDownload::new();
+        std::fs::write(&preserve.final_path, b"keep").unwrap();
+        std::fs::write(&preserve.partial_path, b"partial").unwrap();
+        preserve
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&preserve.id)
+            .unwrap()
+            .status = "completed".to_string();
+        remove_from_list_inner(&preserve.manager, &preserve.id, false).unwrap();
+        assert!(preserve.manager.entries.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&preserve.final_path).unwrap(), b"keep");
+        assert!(!preserve.partial_path.exists());
+
+        let delete = TestDownload::new();
+        std::fs::write(&delete.final_path, b"remove").unwrap();
+        delete
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&delete.id)
+            .unwrap()
+            .status = "completed".to_string();
+        remove_from_list_inner(&delete.manager, &delete.id, true).unwrap();
+        assert!(!delete.final_path.exists());
+        assert!(delete.manager.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_from_list_rejects_active_downloads() {
+        let test_download = TestDownload::new();
+        assert!(remove_from_list_inner(&test_download.manager, &test_download.id, false).is_err());
+        assert!(
+            test_download
+                .manager
+                .entries
+                .lock()
+                .unwrap()
+                .contains_key(&test_download.id)
+        );
+    }
+
+    #[test]
+    fn executable_and_script_downloads_require_open_confirmation() {
+        assert!(requires_open_confirmation(Path::new("program.EXE")));
+        assert!(requires_open_confirmation(Path::new("run.ps1")));
+        assert!(!requires_open_confirmation(Path::new("archive.zip")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn completed_download_receives_windows_zone_identifier() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-zone-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file_path = directory.join("download.bin");
+        std::fs::write(&file_path, b"content").unwrap();
+        mark_of_the_web(&file_path).unwrap();
+        let marker = std::fs::read(format!("{}:Zone.Identifier", file_path.display())).unwrap();
+        assert_eq!(marker, b"[ZoneTransfer]\r\nZoneId=3\r\n");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn start_test_download(
@@ -4990,6 +6135,11 @@ mod tests {
         assert_eq!(duplicate.id, test_download.id);
         assert_eq!(duplicate.filename, "payload.bin");
         assert!(duplicate.duplicate);
+        assert!(parse_http_download_url("file:///archive.zip").is_err());
+        let oversized_url = format!("https://example.com/{}", "x".repeat(8193));
+        assert!(parse_http_download_url(&oversized_url).is_err());
+        assert!(validate_download_id(&test_download.id).is_ok());
+        assert!(validate_download_id("../downloads/other").is_err());
     }
 
     #[test]
@@ -5360,6 +6510,15 @@ mod tests {
             total_bytes: Some(12),
             validator: None,
             retry_count: 0,
+            final_url: None,
+            http_status: None,
+            content_type: None,
+            connection_count: 0,
+            created_at_ms: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+            resume_supported: None,
+            events: VecDeque::new(),
             error: None,
         }
     }
@@ -5432,6 +6591,15 @@ mod tests {
                 validator: None,
                 error: None,
                 retry_count: 0,
+                final_url: None,
+                http_status: None,
+                content_type: None,
+                connection_count: 0,
+                created_at_ms: Some(now_ms()),
+                started_at_ms: None,
+                finished_at_ms: None,
+                resume_supported: None,
+                events: VecDeque::new(),
                 auto_offline: false,
                 control,
                 task_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6421,6 +7589,13 @@ pub fn run() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
+            let log_guard = init_tracing(&app_data_dir).map_err(std::io::Error::other)?;
+            app.manage(log_guard);
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                "RustDLoad started"
+            );
             let download_dir = app.path().download_dir()?;
             let persistence_file = app_data_dir.join("downloads.json");
             let (manager, recovered) = restore_download_manager(persistence_file, &download_dir)
@@ -6469,7 +7644,13 @@ pub fn run() {
             retry_download,
             update_download_url,
             open_download_location,
+            open_file,
+            open_containing_folder,
+            rename_download,
+            remove_from_list,
             list_downloads,
+            get_download_details,
+            export_diagnostics,
             get_download_settings,
             set_max_concurrent_downloads,
             set_file_exists_policy
