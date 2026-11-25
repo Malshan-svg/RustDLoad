@@ -23,8 +23,13 @@ const MIN_CONCURRENT_DOWNLOADS: usize = 1;
 const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 const MAX_SEGMENTS_PER_DOWNLOAD: usize = 4;
 const MIN_SEGMENTED_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024;
+const MAX_NETWORK_RETRIES: u32 = 6;
 const PERSISTED_FORMAT_VERSION: u32 = 1;
 const SEGMENT_RESUME_VERSION: u32 = 1;
+#[cfg(not(test))]
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const STALL_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,6 +169,8 @@ struct DownloadEntry {
     total_bytes: Option<u64>,
     validator: Option<String>,
     error: Option<String>,
+    retry_count: u32,
+    auto_offline: bool,
     control: watch::Sender<Control>,
     task_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -239,6 +246,8 @@ struct PersistedDownload {
     total_bytes: Option<u64>,
     #[serde(default)]
     validator: Option<String>,
+    #[serde(default)]
+    retry_count: u32,
     error: Option<String>,
 }
 
@@ -357,6 +366,7 @@ impl DownloadManager {
                     downloaded_bytes: entry.downloaded_bytes,
                     total_bytes: entry.total_bytes,
                     validator: entry.validator.clone(),
+                    retry_count: entry.retry_count,
                     error: entry.error.clone(),
                 })
                 .collect()
@@ -515,8 +525,10 @@ fn restore_download_manager(
         let partial_path = partial_path_for(&destination, &record.id);
         let sidecar_path = segment_sidecar_path(&destination);
         let sidecar_present = sidecar_path.exists();
-        let sidecar_state = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
-        {
+        let sidecar_state = if matches!(
+            record.status.as_str(),
+            "queued" | "downloading" | "paused" | "link-expired"
+        ) {
             match read_segment_resume_state(&sidecar_path) {
                 Ok(state) => state.filter(|state| state.url == record.url),
                 Err(error) => {
@@ -532,8 +544,10 @@ fn restore_download_manager(
             record.total_bytes = Some(state.total_size);
             record.validator = state.validator.clone();
         }
-        let partial_size = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
-        {
+        let partial_size = if matches!(
+            record.status.as_str(),
+            "queued" | "downloading" | "paused" | "link-expired"
+        ) {
             match std::fs::metadata(&partial_path) {
                 Ok(metadata)
                     if metadata.is_file()
@@ -619,6 +633,8 @@ fn restore_download_manager(
                     total_bytes: record.total_bytes,
                     validator: record.validator.clone(),
                     error: record.error.clone(),
+                    retry_count: record.retry_count,
+                    auto_offline: false,
                     control: sender,
                     task_lock: Arc::new(tokio::sync::Mutex::new(())),
                 },
@@ -854,6 +870,10 @@ fn reconcile_persisted_status(
             false
         }
         "failed" | "cancelled" => false,
+        "link-expired" => {
+            record.downloaded_bytes = partial_size.unwrap_or(record.downloaded_bytes);
+            false
+        }
         _ => {
             record.status = "failed".to_string();
             record.error = Some("The saved download status is invalid.".to_string());
@@ -1163,6 +1183,10 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
         total_bytes,
         message,
     } = failure;
+    let preserve_partial = message.starts_with("Not enough disk space:")
+        || message.starts_with("Could not check free disk space:")
+        || message.starts_with("Disk full:")
+        || message.starts_with("Retry limit reached");
     let sidecar_path = match manager.entries.lock() {
         Ok(entries) => entries
             .get(id)
@@ -1172,39 +1196,43 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
             None
         }
     };
-    let message = match remove_partial_file(path).await {
-        Ok(()) => {
-            if let Some(sidecar_path) = sidecar_path.as_deref()
-                && let Err(error) = remove_segment_sidecar(sidecar_path).await
-            {
-                eprintln!("{error}");
-            }
-            let cancelled = match manager.entries.lock() {
-                Ok(entries) => entries
-                    .get(id)
-                    .map(|entry| *entry.control.borrow() == Control::Cancelled)
-                    .unwrap_or(false),
-                Err(_) => {
-                    eprintln!("Download state is unavailable while reporting failure.");
-                    false
+    let message = if preserve_partial {
+        message
+    } else {
+        match remove_partial_file(path).await {
+            Ok(()) => {
+                if let Some(sidecar_path) = sidecar_path.as_deref()
+                    && let Err(error) = remove_segment_sidecar(sidecar_path).await
+                {
+                    eprintln!("{error}");
                 }
-            };
-            if cancelled {
-                publish_update!(
-                    app,
-                    manager,
-                    id,
-                    filename,
-                    "cancelled",
-                    0,
-                    total_bytes,
-                    None,
-                );
-                return;
+                let cancelled = match manager.entries.lock() {
+                    Ok(entries) => entries
+                        .get(id)
+                        .map(|entry| *entry.control.borrow() == Control::Cancelled)
+                        .unwrap_or(false),
+                    Err(_) => {
+                        eprintln!("Download state is unavailable while reporting failure.");
+                        false
+                    }
+                };
+                if cancelled {
+                    publish_update!(
+                        app,
+                        manager,
+                        id,
+                        filename,
+                        "cancelled",
+                        0,
+                        total_bytes,
+                        None,
+                    );
+                    return;
+                }
+                message
             }
-            message
+            Err(cleanup_error) => format!("{message}; {cleanup_error}"),
         }
-        Err(cleanup_error) => format!("{message}; {cleanup_error}"),
     };
     publish_update!(
         app,
@@ -1238,6 +1266,154 @@ macro_rules! finish_failed {
 enum SlotResult {
     Acquired(DownloadPermit),
     Cancelled,
+}
+
+enum RetryResult {
+    Retry,
+    Interrupted,
+    Exhausted,
+}
+
+struct RetryContext<'a> {
+    id: &'a str,
+    filename: &'a str,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    message: &'a str,
+    offline: bool,
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let seconds = 1u64
+        .checked_shl(attempt.saturating_sub(1).min(5))
+        .unwrap_or(30)
+        .min(30);
+    if cfg!(test) {
+        Duration::from_millis(seconds.min(2) * 10)
+    } else {
+        Duration::from_secs(seconds)
+    }
+}
+
+async fn wait_before_retry<S: UpdateSink + ?Sized>(
+    app: &S,
+    manager: &DownloadManager,
+    retry: RetryContext<'_>,
+    retry_attempts: &mut u32,
+    control: &mut watch::Receiver<Control>,
+) -> RetryResult {
+    let RetryContext {
+        id,
+        filename,
+        downloaded_bytes,
+        total_bytes,
+        message,
+        offline,
+    } = retry;
+    *retry_attempts = retry_attempts.saturating_add(1);
+    let attempt = *retry_attempts;
+    if attempt > MAX_NETWORK_RETRIES {
+        if !offline {
+            return RetryResult::Exhausted;
+        }
+        *retry_attempts = 0;
+    }
+    let delay = if attempt > MAX_NETWORK_RETRIES {
+        Duration::from_secs(30)
+    } else {
+        retry_delay(attempt)
+    };
+    {
+        let mut entries = match manager.entries.lock() {
+            Ok(entries) => entries,
+            Err(_) => {
+                eprintln!("Download state is unavailable while retrying.");
+                return RetryResult::Exhausted;
+            }
+        };
+        let Some(entry) = entries.get_mut(id) else {
+            eprintln!("Download {id} is no longer available while retrying.");
+            return RetryResult::Exhausted;
+        };
+        entry.retry_count = entry.retry_count.saturating_add(1);
+        entry.auto_offline = offline;
+        if offline {
+            entry.control.send_replace(Control::Paused);
+        }
+    }
+    let status = if offline { "paused" } else { "downloading" };
+    let delay_label = if delay.as_secs() > 0 {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{}ms", delay.as_millis())
+    };
+    let description = if attempt > MAX_NETWORK_RETRIES {
+        "Offline. Still unable to reach the server; retrying in 30s.".to_string()
+    } else {
+        let detail = if offline { "Offline" } else { message };
+        format!("{detail}. Retrying in {delay_label} (attempt {attempt}/{MAX_NETWORK_RETRIES}).")
+    };
+    publish_update!(
+        app,
+        manager,
+        id,
+        filename,
+        status,
+        downloaded_bytes,
+        total_bytes,
+        Some(description),
+    );
+    if let Err(error) = manager.persist() {
+        eprintln!("{error}");
+    }
+    if offline {
+        let _ = control.borrow_and_update();
+    }
+
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        changed = control.changed() => {
+            if changed.is_err() || *control.borrow() != Control::Running {
+                return RetryResult::Interrupted;
+            }
+            return RetryResult::Interrupted;
+        }
+    }
+    if offline {
+        let resumed = match manager.entries.lock() {
+            Ok(mut entries) => {
+                if let Some(entry) = entries.get_mut(id)
+                    && entry.auto_offline
+                    && *control.borrow() == Control::Paused
+                {
+                    entry.auto_offline = false;
+                    entry.control.send_replace(Control::Running);
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                eprintln!("Download state is unavailable while recovering the connection.");
+                false
+            }
+        };
+        if !resumed {
+            return RetryResult::Interrupted;
+        }
+        let _ = control.borrow_and_update();
+        publish_update!(
+            app,
+            manager,
+            id,
+            filename,
+            "downloading",
+            downloaded_bytes,
+            total_bytes,
+            None,
+        );
+    }
+    RetryResult::Retry
 }
 
 fn pause_active_downloads(manager: &DownloadManager) -> Result<(), String> {
@@ -1316,6 +1492,7 @@ async fn finalize_file(destination: &Path, partial_path: &Path) -> Result<(), St
 enum SegmentedAttempt {
     Completed(u64),
     Fallback,
+    Retryable(String, bool),
     Paused(u64, u64, Option<String>),
     Cancelled(u64, u64),
 }
@@ -1323,8 +1500,13 @@ enum SegmentedAttempt {
 enum SegmentWorkerResult {
     Completed,
     Invalid,
+    Retryable(String, bool),
     Controlled(Control),
     Failed(String),
+}
+
+fn is_offline_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
 }
 
 async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
@@ -1366,7 +1548,9 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
     let response = tokio::select! {
         result = request.send() => match result {
             Ok(response) => response,
-            Err(_) => return SegmentWorkerResult::Invalid,
+            Err(error) => {
+                return SegmentWorkerResult::Retryable(error.to_string(), is_offline_error(&error));
+            }
         },
         changed = control.changed() => {
             if changed.is_err() || *control.borrow() != Control::Running {
@@ -1404,8 +1588,9 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
     {
         Ok(file) => file,
         Err(error) => {
-            return SegmentWorkerResult::Failed(format!(
-                "Could not open the partial download for a segment: {error}"
+            return SegmentWorkerResult::Failed(disk_error_message(
+                "Could not open the partial download for a segment",
+                error,
             ));
         }
     };
@@ -1418,14 +1603,15 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
     let mut written = 0u64;
     loop {
         tokio::select! {
-            chunk = stream.next() => match chunk {
-                Some(Ok(chunk)) => {
+            chunk = tokio::time::timeout(STALL_TIMEOUT, stream.next()) => match chunk {
+                Ok(Some(Ok(chunk))) => {
                     if written.saturating_add(chunk.len() as u64) > segment_end - position + 1 {
                         return SegmentWorkerResult::Invalid;
                     }
                     if let Err(error) = file.write_all(&chunk).await {
-                        return SegmentWorkerResult::Failed(format!(
-                            "Could not write a download segment: {error}"
+                        return SegmentWorkerResult::Failed(disk_error_message(
+                            "Could not write a download segment",
+                            error,
                         ));
                     }
                     written += chunk.len() as u64;
@@ -1463,20 +1649,50 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
                         }
                     }
                 }
-                Some(Err(_)) => return SegmentWorkerResult::Invalid,
-                None => break,
+                Ok(Some(Err(error))) => {
+                    if let Err(checkpoint_error) = checkpoint_segment_failure(
+                        &mut file,
+                        &tracker,
+                        segment_index,
+                        position + written,
+                    ).await {
+                        return SegmentWorkerResult::Failed(checkpoint_error);
+                    }
+                    return SegmentWorkerResult::Retryable(
+                        error.to_string(),
+                        is_offline_error(&error),
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if let Err(error) = checkpoint_segment_failure(
+                        &mut file,
+                        &tracker,
+                        segment_index,
+                        position + written,
+                    ).await {
+                        return SegmentWorkerResult::Failed(error);
+                    }
+                    return SegmentWorkerResult::Retryable(
+                        "No data received from the server before the 15-second stall timeout."
+                            .to_string(),
+                        false,
+                    );
+                }
             },
             changed = control.changed() => {
                 if changed.is_err() || *control.borrow() != Control::Running {
                     let state = *control.borrow();
                     if let Err(error) = file.flush().await {
-                        return SegmentWorkerResult::Failed(format!(
-                            "Could not flush a paused download segment: {error}"
+                        return SegmentWorkerResult::Failed(disk_error_message(
+                            "Could not flush a paused download segment",
+                            error,
                         ));
                     }
                     if let Err(error) = file.sync_data().await {
-                        return SegmentWorkerResult::Failed(format!(
-                            "Could not checkpoint a download segment: {error}"
+                        return SegmentWorkerResult::Failed(disk_error_message(
+                            "Could not checkpoint a download segment",
+                            error,
                         ));
                     }
                     if let Err(error) = tracker
@@ -1492,15 +1708,22 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
         }
     }
     if let Err(error) = file.flush().await {
-        return SegmentWorkerResult::Failed(format!("Could not flush a download segment: {error}"));
+        return SegmentWorkerResult::Failed(disk_error_message(
+            "Could not flush a download segment",
+            error,
+        ));
     }
     if let Err(error) = file.sync_data().await {
-        return SegmentWorkerResult::Failed(format!(
-            "Could not checkpoint a download segment: {error}"
+        return SegmentWorkerResult::Failed(disk_error_message(
+            "Could not checkpoint a download segment",
+            error,
         ));
     }
     if written != segment_end - position + 1 {
-        SegmentWorkerResult::Invalid
+        SegmentWorkerResult::Retryable(
+            "The server closed the connection before the requested range was complete.".to_string(),
+            false,
+        )
     } else {
         match tracker
             .checkpoint(segment_index, segment_end + 1, true)
@@ -1512,16 +1735,69 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
     }
 }
 
+async fn checkpoint_segment_failure(
+    file: &mut tokio::fs::File,
+    tracker: &SegmentResumeTracker,
+    segment_index: usize,
+    next_position: u64,
+) -> Result<(), String> {
+    file.flush()
+        .await
+        .map_err(|error| disk_error_message("Could not flush a failed download segment", error))?;
+    file.sync_data().await.map_err(|error| {
+        disk_error_message("Could not checkpoint a failed download segment", error)
+    })?;
+    tracker.checkpoint(segment_index, next_position, true).await
+}
+
 async fn create_preallocated_partial(path: &Path, total: u64) -> Result<(), String> {
+    ensure_disk_space(path, total, true)?;
     let file = tokio::fs::File::create(path)
         .await
-        .map_err(|error| format!("Could not prepare the partial download: {error}"))?;
+        .map_err(|error| disk_error_message("Could not prepare the partial download", error))?;
     file.set_len(total)
         .await
-        .map_err(|error| format!("Could not preallocate the partial download: {error}"))?;
+        .map_err(|error| disk_error_message("Could not preallocate the partial download", error))?;
     file.sync_all()
         .await
-        .map_err(|error| format!("Could not flush the preallocated download: {error}"))
+        .map_err(|error| disk_error_message("Could not flush the preallocated download", error))
+}
+
+fn enough_disk_space(required: u64, available: u64, reclaimable: u64) -> bool {
+    required <= available.saturating_add(reclaimable)
+}
+
+fn ensure_disk_space(path: &Path, required: u64, replacing_partial: bool) -> Result<(), String> {
+    if required == 0 {
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let available = fs2::available_space(parent)
+        .map_err(|error| format!("Could not check free disk space: {error}"))?;
+    let reclaimable = if replacing_partial {
+        std::fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if !enough_disk_space(required, available, reclaimable) {
+        return Err(format!(
+            "Not enough disk space: need {required} bytes, only {} bytes are available.",
+            available.saturating_add(reclaimable)
+        ));
+    }
+    Ok(())
+}
+
+fn disk_error_message(context: &str, error: std::io::Error) -> String {
+    if error.kind() == ErrorKind::StorageFull {
+        format!("Disk full: {error}")
+    } else {
+        format!("{context}: {error}")
+    }
 }
 
 fn new_segment_resume_state(
@@ -1586,7 +1862,15 @@ async fn try_segmented_download(
         .header(reqwest::header::RANGE, "bytes=0-0")
         .header(reqwest::header::ACCEPT_ENCODING, "identity");
     let probe = tokio::select! {
-        result = probe_request.send() => result.map_err(|error| error.to_string())?,
+        result = probe_request.send() => match result {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(SegmentedAttempt::Retryable(
+                    error.to_string(),
+                    is_offline_error(&error),
+                ));
+            }
+        },
         changed = control.changed() => {
             return Ok(match *control.borrow() {
                 Control::Paused => SegmentedAttempt::Paused(
@@ -1697,6 +1981,7 @@ async fn try_segmented_download(
     let state = if let Some(state) = resume_state {
         state
     } else {
+        ensure_disk_space(path, total, true)?;
         let state = new_segment_resume_state(url, &final_url, total, validator.clone());
         persist_segment_resume_state(sidecar_path, &state).await?;
         create_preallocated_partial(path, total).await?;
@@ -1779,6 +2064,10 @@ async fn try_segmented_download(
                 worker_error = Some(error);
                 break;
             }
+            Ok(SegmentWorkerResult::Retryable(message, offline)) => {
+                attempt = SegmentedAttempt::Retryable(message, offline);
+                break;
+            }
             Ok(SegmentWorkerResult::Controlled(Control::Running))
             | Ok(SegmentWorkerResult::Invalid) => match *control.borrow() {
                 Control::Paused => {
@@ -1820,7 +2109,9 @@ async fn try_segmented_download(
     }
     if matches!(
         attempt,
-        SegmentedAttempt::Fallback | SegmentedAttempt::Cancelled(_, _)
+        SegmentedAttempt::Fallback
+            | SegmentedAttempt::Retryable(_, _)
+            | SegmentedAttempt::Cancelled(_, _)
     ) {
         workers.abort_all();
     }
@@ -1887,7 +2178,26 @@ async fn download_file_inner(
         destination,
         partial_path: path,
     } = download;
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            finish_failed!(
+                &app,
+                &manager,
+                &id,
+                &filename,
+                &path,
+                0,
+                None,
+                format!("Could not configure the download connection: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
     let sidecar_path = segment_sidecar_path(&destination);
     let mut validator = manager
         .entries
@@ -1897,6 +2207,7 @@ async fn download_file_inner(
     let mut total_bytes = None;
     let mut last_update = Instant::now();
     let mut force_sequential = false;
+    let mut retry_attempts = 0;
 
     loop {
         let offset = if sidecar_path.exists() {
@@ -2039,6 +2350,49 @@ async fn download_file_inner(
                     force_sequential = true;
                     continue;
                 }
+                Ok(SegmentedAttempt::Retryable(message, offline)) => {
+                    let progress = manager
+                        .entries
+                        .lock()
+                        .ok()
+                        .and_then(|entries| entries.get(&id).map(|entry| entry.downloaded_bytes))
+                        .unwrap_or(offset);
+                    drop(_slot);
+                    match wait_before_retry(
+                        &*app,
+                        &manager,
+                        RetryContext {
+                            id: &id,
+                            filename: &filename,
+                            downloaded_bytes: progress,
+                            total_bytes,
+                            message: &message,
+                            offline,
+                        },
+                        &mut retry_attempts,
+                        &mut control,
+                    )
+                    .await
+                    {
+                        RetryResult::Retry | RetryResult::Interrupted => continue,
+                        RetryResult::Exhausted => {
+                            finish_failed!(
+                                &app,
+                                &manager,
+                                &id,
+                                &filename,
+                                &path,
+                                progress,
+                                total_bytes,
+                                format!(
+                                    "Retry limit reached after {MAX_NETWORK_RETRIES} attempts: {message}"
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
                 Ok(SegmentedAttempt::Paused(progress, total, segment_validator)) => {
                     if segment_validator.is_some() {
                         validator = segment_validator.clone();
@@ -2115,10 +2469,39 @@ async fn download_file_inner(
             result = request.send() => match result {
                 Ok(response) => response,
                 Err(error) => {
-                    finish_failed!(
-                        &app, &manager, &id, &filename, &path, offset, total_bytes, error.to_string()
-                    ).await;
-                    return;
+                    let message = error.to_string();
+                    drop(_slot);
+                    match wait_before_retry(
+                        &*app,
+                        &manager,
+                        RetryContext {
+                            id: &id,
+                            filename: &filename,
+                            downloaded_bytes: offset,
+                            total_bytes,
+                            message: &message,
+                            offline: is_offline_error(&error),
+                        },
+                        &mut retry_attempts,
+                        &mut control,
+                    ).await {
+                        RetryResult::Retry | RetryResult::Interrupted => continue,
+                        RetryResult::Exhausted => {
+                            finish_failed!(
+                                &app,
+                                &manager,
+                                &id,
+                                &filename,
+                                &path,
+                                offset,
+                                total_bytes,
+                                format!(
+                                    "Retry limit reached after {MAX_NETWORK_RETRIES} attempts: {message}"
+                                ),
+                            ).await;
+                            return;
+                        }
+                    }
                 }
             },
             changed = control.changed() => {
@@ -2151,7 +2534,7 @@ async fn download_file_inner(
                     &path,
                     offset,
                     total_bytes,
-                    format!("Could not restart the download: {error}"),
+                    disk_error_message("Could not restart the download", error),
                 )
                 .await;
                 return;
@@ -2159,6 +2542,26 @@ async fn download_file_inner(
             validator = None;
             total_bytes = None;
             continue;
+        }
+
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE
+        ) {
+            let status = response.status();
+            publish_update!(
+                &app,
+                &manager,
+                &id,
+                &filename,
+                "link-expired",
+                offset,
+                total_bytes,
+                Some(format!(
+                    "Link expired (HTTP {status}). Update the URL to continue this download."
+                )),
+            );
+            return;
         }
 
         if let Err(error) = response.error_for_status_ref() {
@@ -2203,7 +2606,7 @@ async fn download_file_inner(
                         &path,
                         offset,
                         total_bytes,
-                        format!("Could not restart the download: {error}"),
+                        disk_error_message("Could not restart the download", error),
                     )
                     .await;
                     return;
@@ -2263,6 +2666,30 @@ async fn download_file_inner(
             return;
         };
 
+        let required_space = if truncate {
+            response.content_length().or(total_bytes).unwrap_or(0)
+        } else if let Some(end) = range_end {
+            end.saturating_sub(offset).saturating_add(1)
+        } else {
+            total_bytes
+                .map(|total| total.saturating_sub(offset))
+                .unwrap_or(0)
+        };
+        if let Err(error) = ensure_disk_space(&path, required_space, truncate) {
+            finish_failed!(
+                &app,
+                &manager,
+                &id,
+                &filename,
+                &path,
+                offset,
+                total_bytes,
+                error,
+            )
+            .await;
+            return;
+        }
+
         if truncate {
             if let Err(error) = tokio::fs::File::create(&path).await {
                 finish_failed!(
@@ -2273,7 +2700,7 @@ async fn download_file_inner(
                     &path,
                     offset,
                     total_bytes,
-                    format!("Could not restart the download: {error}"),
+                    disk_error_message("Could not restart the download", error),
                 )
                 .await;
                 return;
@@ -2303,7 +2730,7 @@ async fn download_file_inner(
                     &path,
                     offset,
                     total_bytes,
-                    format!("Could not open the partial download: {error}"),
+                    disk_error_message("Could not open the partial download", error),
                 )
                 .await;
                 return;
@@ -2324,14 +2751,14 @@ async fn download_file_inner(
         );
         let mut paused = false;
         let mut cancelled = false;
-        let mut stream_error = None;
+        let mut stream_error: Option<(String, bool, bool)> = None;
 
         loop {
             tokio::select! {
-                chunk = stream.next() => match chunk {
-                    Some(Ok(chunk)) => {
+                chunk = tokio::time::timeout(STALL_TIMEOUT, stream.next()) => match chunk {
+                    Ok(Some(Ok(chunk))) => {
                         if let Err(error) = file.write_all(&chunk).await {
-                            stream_error = Some(error.to_string());
+                            stream_error = Some((disk_error_message("Disk write failed", error), false, false));
                             break;
                         }
                         downloaded_bytes += chunk.len() as u64;
@@ -2343,11 +2770,24 @@ async fn download_file_inner(
                             last_update = Instant::now();
                         }
                     }
-                    Some(Err(error)) => {
-                        stream_error = Some(error.to_string());
+                    Ok(Some(Err(error))) => {
+                        stream_error = Some((
+                            error.to_string(),
+                            true,
+                            is_offline_error(&error),
+                        ));
                         break;
                     }
-                    None => break,
+                    Ok(None) => break,
+                    Err(_) => {
+                        stream_error = Some((
+                            "No data received from the server before the 15-second stall timeout."
+                                .to_string(),
+                            true,
+                            false,
+                        ));
+                        break;
+                    }
                 },
                 changed = control.changed() => {
                     if changed.is_err() || *control.borrow() == Control::Cancelled {
@@ -2363,7 +2803,11 @@ async fn download_file_inner(
         }
 
         if let Err(error) = file.flush().await {
-            stream_error = Some(format!("Could not flush the partial download: {error}"));
+            stream_error = Some((
+                disk_error_message("Could not flush the partial download", error),
+                false,
+                false,
+            ));
         }
         drop(file);
         drop(stream);
@@ -2436,7 +2880,44 @@ async fn download_file_inner(
             continue;
         }
 
-        if let Some(error) = stream_error {
+        if let Some((error, retryable, offline)) = stream_error {
+            if retryable {
+                drop(_slot);
+                match wait_before_retry(
+                    &*app,
+                    &manager,
+                    RetryContext {
+                        id: &id,
+                        filename: &filename,
+                        downloaded_bytes,
+                        total_bytes,
+                        message: &error,
+                        offline,
+                    },
+                    &mut retry_attempts,
+                    &mut control,
+                )
+                .await
+                {
+                    RetryResult::Retry | RetryResult::Interrupted => continue,
+                    RetryResult::Exhausted => {
+                        finish_failed!(
+                            &app,
+                            &manager,
+                            &id,
+                            &filename,
+                            &path,
+                            downloaded_bytes,
+                            total_bytes,
+                            format!(
+                                "Retry limit reached after {MAX_NETWORK_RETRIES} attempts: {error}"
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             finish_failed!(
                 &app,
                 &manager,
@@ -2559,6 +3040,7 @@ fn control_download(
             return Ok(());
         }
         entry.control.send_replace(action);
+        entry.auto_offline = false;
         entry.status = status.to_string();
         entry.error = None;
         DownloadUpdate {
@@ -2578,7 +3060,10 @@ fn control_download(
 }
 
 fn validate_transition(current: &str, target: &str) -> Result<(), String> {
-    if matches!(current, "completed" | "failed" | "cancelled") {
+    if matches!(
+        current,
+        "completed" | "failed" | "cancelled" | "link-expired"
+    ) {
         return Err(format!(
             "Cannot {target} a download that is already {current}."
         ));
@@ -2657,6 +3142,8 @@ async fn start_download(
                 total_bytes: None,
                 validator: None,
                 error: None,
+                retry_count: 0,
+                auto_offline: false,
                 control: sender,
                 task_lock: Arc::new(tokio::sync::Mutex::new(())),
             },
@@ -2740,6 +3227,168 @@ struct RetryDownload {
     control: watch::Receiver<Control>,
 }
 
+struct ReplacementUrlProbe {
+    final_url: String,
+    total_size: Option<u64>,
+    validator: Option<String>,
+    supports_ranges: bool,
+}
+
+async fn probe_replacement_url(url: &reqwest::Url) -> Result<ReplacementUrlProbe, String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("Could not prepare the replacement URL check: {error}"))?
+        .get(url.clone())
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach the replacement URL: {error}"))?;
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE
+    ) {
+        return Err(format!(
+            "The replacement URL is also expired (HTTP {status})."
+        ));
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        let final_url = response.url().to_string();
+        let validator = response_validator(&response);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("Could not check the replacement URL response: {error}"))?;
+        let Some((0, 0, total_size)) = content_range else {
+            return Err("The replacement URL returned an invalid byte-range probe.".to_string());
+        };
+        if body.len() != 1 {
+            return Err("The replacement URL returned an invalid byte-range body.".to_string());
+        }
+        return Ok(ReplacementUrlProbe {
+            final_url,
+            total_size: Some(total_size),
+            validator,
+            supports_ranges: true,
+        });
+    }
+    if status == reqwest::StatusCode::OK {
+        let probe = ReplacementUrlProbe {
+            final_url: response.url().to_string(),
+            total_size: response.content_length(),
+            validator: response_validator(&response),
+            supports_ranges: false,
+        };
+        return Ok(probe);
+    }
+    Err(format!(
+        "The replacement URL returned an unsupported HTTP status: {status}."
+    ))
+}
+
+async fn prepare_download_url_update(
+    manager: &DownloadManager,
+    id: &str,
+    new_url: &str,
+) -> Result<DownloadContext, String> {
+    let parsed_url = reqwest::Url::parse(new_url).map_err(|error| error.to_string())?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err("Only HTTP and HTTPS download links are supported.".to_string());
+    }
+    let (filename, destination, old_total, old_validator) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if entry.status != "link-expired" {
+            return Err("Only downloads with an expired link can be updated.".to_string());
+        }
+        (
+            entry.filename.clone(),
+            entry.destination.clone(),
+            entry.total_bytes,
+            entry.validator.clone(),
+        )
+    };
+    let probe = probe_replacement_url(&parsed_url).await?;
+    let path = partial_path_for(&destination, id);
+    let sidecar_path = segment_sidecar_path(&destination);
+    let old_state = read_segment_resume_state(&sidecar_path)?;
+    let expected_total = old_state
+        .as_ref()
+        .map(|state| state.total_size)
+        .or(old_total);
+    let expected_validator = old_state
+        .as_ref()
+        .and_then(|state| state.validator.clone())
+        .or(old_validator);
+    let partial_size = tokio::fs::metadata(&path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len());
+    let resumable = probe.supports_ranges
+        && probe.total_size == expected_total
+        && expected_validator.is_some()
+        && probe.validator == expected_validator
+        && match (old_state.as_ref(), partial_size, probe.total_size) {
+            (Some(_), Some(size), Some(total)) => size == total,
+            (None, Some(size), Some(total)) => size <= total,
+            _ => false,
+        };
+    let downloaded_bytes = if resumable {
+        if let Some(mut state) = old_state {
+            state.url = parsed_url.to_string();
+            state.final_url = probe.final_url.clone();
+            state.validator = probe.validator.clone();
+            persist_segment_resume_state(&sidecar_path, &state).await?;
+            segment_progress(&state)
+        } else {
+            partial_size.unwrap_or(0)
+        }
+    } else {
+        create_preallocated_partial(&path, 0).await?;
+        remove_segment_sidecar(&sidecar_path).await?;
+        0
+    };
+
+    {
+        let mut entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        entry.url = parsed_url.to_string();
+        entry.status = "queued".to_string();
+        entry.downloaded_bytes = downloaded_bytes;
+        entry.total_bytes = probe.total_size;
+        entry.validator = probe.validator;
+        entry.error = None;
+        entry.auto_offline = false;
+        entry.control.send_replace(Control::Running);
+    }
+    manager.persist()?;
+    Ok(DownloadContext {
+        id: id.to_string(),
+        url: parsed_url.to_string(),
+        filename,
+        destination: destination.clone(),
+        partial_path: path,
+    })
+}
+
 fn prepare_download_retry(manager: &DownloadManager, id: &str) -> Result<RetryDownload, String> {
     let mut entries = manager
         .entries
@@ -2753,9 +3402,10 @@ fn prepare_download_retry(manager: &DownloadManager, id: &str) -> Result<RetryDo
     }
 
     let destination = entry.destination.clone();
+    let url = entry.url.clone();
     ensure_destination_available(&destination, &entries)?;
     let partial_path = partial_path_for(&destination, id);
-    let downloaded_bytes = match std::fs::metadata(&partial_path) {
+    let partial_size = match std::fs::metadata(&partial_path) {
         Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => return Err("The partial download path is not a file.".to_string()),
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -2769,6 +3419,17 @@ fn prepare_download_retry(manager: &DownloadManager, id: &str) -> Result<RetryDo
         Err(error) => {
             return Err(format!("Could not inspect the partial download: {error}"));
         }
+    };
+    let sidecar = read_segment_resume_state(&segment_sidecar_path(&destination))?;
+    let downloaded_bytes = match sidecar {
+        Some(state)
+            if state.url == url
+                && partial_size == state.total_size
+                && valid_segment_resume_state(&state) =>
+        {
+            segment_progress(&state)
+        }
+        _ => partial_size,
     };
 
     let entry = entries
@@ -2840,6 +3501,62 @@ async fn retry_download(
 }
 
 #[tauri::command]
+async fn update_download_url(
+    app: AppHandle,
+    manager: State<'_, DownloadManager>,
+    id: String,
+    new_url: String,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    let task_lock = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(&id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if entry.status != "link-expired" {
+            return Err("Only downloads with an expired link can be updated.".to_string());
+        }
+        entry.task_lock.clone()
+    };
+    let _task_guard = task_lock.lock().await;
+    let download = prepare_download_url_update(&manager, &id, &new_url).await?;
+    let (filename, downloaded_bytes, total_bytes, receiver) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(&id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        (
+            entry.filename.clone(),
+            entry.downloaded_bytes,
+            entry.total_bytes,
+            entry.control.subscribe(),
+        )
+    };
+    publish_update!(
+        &app,
+        &manager,
+        &id,
+        &filename,
+        "queued",
+        downloaded_bytes,
+        total_bytes,
+        None,
+    );
+
+    let task_manager = manager.clone();
+    tauri::async_runtime::spawn(async move {
+        download_file(app, task_manager, download, receiver).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
 fn open_download_location(manager: State<'_, DownloadManager>, id: String) -> Result<(), String> {
     let directory = {
         let entries = manager
@@ -2906,17 +3623,19 @@ fn set_max_concurrent_downloads(
 #[cfg(test)]
 mod tests {
     use super::{
-        Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadManager,
-        DownloadUpdate, PersistedDownload, PersistedSettings, SEGMENT_RESUME_VERSION,
-        SegmentPosition, SegmentResumeState, SlotResult, UpdateSink, acquire_download_slot,
-        download_file_inner, ensure_destination_available, filename_from_url, finalize_file,
-        is_reserved_windows_name, numbered_filename, parse_content_range, partial_path_for,
-        pause_active_downloads, persist_max_concurrent_downloads, persist_segment_resume_state,
-        persist_snapshot, prepare_download_retry, read_max_concurrent_downloads,
-        read_persisted_queue, read_segment_resume_state, reconcile_persisted_status,
-        restore_download_manager, segment_progress, segment_ranges, segment_sidecar_path,
-        valid_range_probe, valid_segment_response, valid_segment_resume_state,
-        validate_max_concurrent_downloads, validate_transition, validators_compatible,
+        Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadFailure,
+        DownloadManager, DownloadUpdate, PersistedDownload, PersistedSettings, RetryContext,
+        RetryResult, SEGMENT_RESUME_VERSION, SegmentPosition, SegmentResumeState, SlotResult,
+        UpdateSink, acquire_download_slot, download_file_inner, enough_disk_space,
+        ensure_destination_available, ensure_disk_space, filename_from_url, finalize_file,
+        finish_failed, is_reserved_windows_name, numbered_filename, parse_content_range,
+        partial_path_for, pause_active_downloads, persist_max_concurrent_downloads,
+        persist_segment_resume_state, persist_snapshot, prepare_download_retry,
+        prepare_download_url_update, read_max_concurrent_downloads, read_persisted_queue,
+        read_segment_resume_state, reconcile_persisted_status, restore_download_manager,
+        segment_progress, segment_ranges, segment_sidecar_path, valid_range_probe,
+        valid_segment_response, valid_segment_resume_state, validate_max_concurrent_downloads,
+        validate_transition, validators_compatible, wait_before_retry,
     };
     use std::{
         io::{Read, Write},
@@ -2950,11 +3669,14 @@ mod tests {
         Gone,
         SlowRanges,
         SlowStreamingRanges,
+        StallsSegmentBodies,
+        StallsSequentialBody,
     }
 
     struct LocalHttpServer {
         url: String,
         range_requests: Arc<AtomicUsize>,
+        identity_range_requests: Arc<AtomicUsize>,
         requested_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
         slow: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
@@ -2968,17 +3690,24 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let body = Arc::new(body);
             let range_requests = Arc::new(AtomicUsize::new(0));
+            let identity_range_requests = Arc::new(AtomicUsize::new(0));
             let requested_ranges = Arc::new(Mutex::new(Vec::new()));
             let slow = Arc::new(AtomicBool::new(matches!(
                 behavior,
-                ServerBehavior::SlowRanges | ServerBehavior::SlowStreamingRanges
+                ServerBehavior::SlowRanges
+                    | ServerBehavior::SlowStreamingRanges
+                    | ServerBehavior::StallsSegmentBodies
+                    | ServerBehavior::StallsSequentialBody
             )));
+            let drop_once = Arc::new(AtomicBool::new(true));
             let shutdown = Arc::new(AtomicBool::new(false));
 
             let thread_body = body.clone();
             let thread_range_requests = range_requests.clone();
+            let thread_identity_range_requests = identity_range_requests.clone();
             let thread_requested_ranges = requested_ranges.clone();
             let thread_slow = slow.clone();
+            let thread_drop_once = drop_once.clone();
             let thread_shutdown = shutdown.clone();
             let server_thread = thread::spawn(move || {
                 while !thread_shutdown.load(Ordering::Acquire) {
@@ -2986,16 +3715,20 @@ mod tests {
                         Ok((stream, _)) => {
                             let body = thread_body.clone();
                             let range_requests = thread_range_requests.clone();
+                            let identity_range_requests = thread_identity_range_requests.clone();
                             let requested_ranges = thread_requested_ranges.clone();
                             let slow = thread_slow.clone();
+                            let drop_once = thread_drop_once.clone();
                             thread::spawn(move || {
                                 serve_download_request(
                                     stream,
                                     body,
                                     behavior,
                                     range_requests,
+                                    identity_range_requests,
                                     requested_ranges,
                                     slow,
+                                    drop_once,
                                 );
                             });
                         }
@@ -3010,6 +3743,7 @@ mod tests {
             Self {
                 url: format!("http://{address}/payload.bin"),
                 range_requests,
+                identity_range_requests,
                 requested_ranges,
                 slow,
                 shutdown,
@@ -3033,8 +3767,10 @@ mod tests {
         body: Arc<Vec<u8>>,
         behavior: ServerBehavior,
         range_requests: Arc<AtomicUsize>,
+        identity_range_requests: Arc<AtomicUsize>,
         requested_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
         slow: Arc<AtomicBool>,
+        drop_once: Arc<AtomicBool>,
     ) {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -3054,6 +3790,12 @@ mod tests {
         }
 
         let request = String::from_utf8_lossy(&request);
+        let accepts_identity = request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("accept-encoding")
+                    && value.trim().eq_ignore_ascii_case("identity")
+            })
+        });
         let range = request.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             if !name.eq_ignore_ascii_case("range") {
@@ -3071,10 +3813,16 @@ mod tests {
         });
         if range.is_some() {
             range_requests.fetch_add(1, Ordering::Relaxed);
+            if accepts_identity {
+                identity_range_requests.fetch_add(1, Ordering::Relaxed);
+            }
             requested_ranges.lock().unwrap().push(range.unwrap());
         }
         let is_probe = range == Some((0, 0));
-        let ignores_range = behavior == ServerBehavior::IgnoresRanges;
+        let ignores_range = matches!(
+            behavior,
+            ServerBehavior::IgnoresRanges | ServerBehavior::StallsSequentialBody
+        );
         let (status, mut response_body, content_range) = match behavior {
             ServerBehavior::HtmlErrorPage => (
                 200,
@@ -3102,8 +3850,10 @@ mod tests {
         if short_range_body {
             response_body.truncate((response_body.len() / 2).max(1));
         }
-        let drops_segment_connection =
-            behavior == ServerBehavior::DropsSegmentConnections && range.is_some() && !is_probe;
+        let drops_segment_connection = behavior == ServerBehavior::DropsSegmentConnections
+            && range.is_some()
+            && !is_probe
+            && drop_once.swap(false, Ordering::AcqRel);
         let etag = if behavior == ServerBehavior::ChangesValidator && range.is_some() && !is_probe {
             "\"changed\""
         } else {
@@ -3137,6 +3887,16 @@ mod tests {
             return;
         }
         if behavior == ServerBehavior::SlowRanges && range.is_some() {
+            while slow.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        if behavior == ServerBehavior::StallsSegmentBodies && range.is_some() && !is_probe {
+            while slow.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        if behavior == ServerBehavior::StallsSequentialBody && range.is_none() {
             while slow.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -3175,6 +3935,16 @@ mod tests {
         fn emit_download_update(&self, _update: DownloadUpdate) {}
     }
 
+    struct RecordingUpdateSink {
+        updates: Arc<Mutex<Vec<DownloadUpdate>>>,
+    }
+
+    impl UpdateSink for RecordingUpdateSink {
+        fn emit_download_update(&self, update: DownloadUpdate) {
+            self.updates.lock().unwrap().push(update);
+        }
+    }
+
     impl TestDownload {
         fn new() -> Self {
             let id = uuid::Uuid::new_v4().to_string();
@@ -3196,6 +3966,8 @@ mod tests {
                     total_bytes: None,
                     validator: None,
                     error: None,
+                    retry_count: 0,
+                    auto_offline: false,
                     control: control_sender.clone(),
                     task_lock: Arc::new(tokio::sync::Mutex::new(())),
                 },
@@ -3268,6 +4040,18 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("server did not receive {minimum} range requests");
+    }
+
+    async fn wait_for_retry_count(test_download: &TestDownload, minimum: u32) {
+        for _ in 0..10_000 {
+            if test_download.manager.entries.lock().unwrap()[&test_download.id].retry_count
+                >= minimum
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("download did not reach retry count {minimum}");
     }
 
     async fn wait_for_status(test_download: &TestDownload, status: &str) {
@@ -3595,6 +4379,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn offline_retry_pauses_with_reason_and_automatically_resumes() {
+        let _guard = http_test_guard();
+        let test_download = TestDownload::new();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let app = RecordingUpdateSink {
+            updates: updates.clone(),
+        };
+        let mut control = test_download.control_receiver.clone();
+        let mut retry_attempts = 0;
+
+        let result = wait_before_retry(
+            &app,
+            &test_download.manager,
+            RetryContext {
+                id: &test_download.id,
+                filename: "payload.bin",
+                downloaded_bytes: 0,
+                total_bytes: Some(100),
+                message: "connection failed",
+                offline: true,
+            },
+            &mut retry_attempts,
+            &mut control,
+        )
+        .await;
+
+        assert!(matches!(result, RetryResult::Retry));
+        assert_eq!(test_download.status(), "downloading");
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].retry_count,
+            1
+        );
+        assert!(*control.borrow() == Control::Running);
+        assert!(updates.lock().unwrap().iter().any(|update| {
+            update.status == "paused"
+                && update
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Offline"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn network_retry_count_is_capped_for_non_offline_failures() {
+        let _guard = http_test_guard();
+        let test_download = TestDownload::new();
+        let app = TestUpdateSink;
+        let mut control = test_download.control_receiver.clone();
+        let mut retry_attempts = 0;
+
+        for _ in 0..super::MAX_NETWORK_RETRIES {
+            let result = wait_before_retry(
+                &app,
+                &test_download.manager,
+                RetryContext {
+                    id: &test_download.id,
+                    filename: "payload.bin",
+                    downloaded_bytes: 0,
+                    total_bytes: Some(100),
+                    message: "connection closed",
+                    offline: false,
+                },
+                &mut retry_attempts,
+                &mut control,
+            )
+            .await;
+            assert!(matches!(result, RetryResult::Retry));
+        }
+        let result = wait_before_retry(
+            &app,
+            &test_download.manager,
+            RetryContext {
+                id: &test_download.id,
+                filename: "payload.bin",
+                downloaded_bytes: 0,
+                total_bytes: Some(100),
+                message: "connection closed",
+                offline: false,
+            },
+            &mut retry_attempts,
+            &mut control,
+        )
+        .await;
+
+        assert!(matches!(result, RetryResult::Exhausted));
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].retry_count,
+            super::MAX_NETWORK_RETRIES
+        );
+    }
+
     fn persisted_download(status: &str, downloaded_bytes: u64) -> PersistedDownload {
         PersistedDownload {
             id: "c04e4566-0d5e-47c6-8863-9f2d6d327849".to_string(),
@@ -3605,6 +4481,7 @@ mod tests {
             downloaded_bytes,
             total_bytes: Some(12),
             validator: None,
+            retry_count: 0,
             error: None,
         }
     }
@@ -3641,6 +4518,11 @@ mod tests {
         let mut missing = persisted_download("completed", 12);
         assert!(!reconcile_persisted_status(&mut missing, None, None));
         assert_eq!(missing.status, "failed");
+
+        let mut expired = persisted_download("link-expired", 12);
+        assert!(!reconcile_persisted_status(&mut expired, Some(5), None));
+        assert_eq!(expired.status, "link-expired");
+        assert_eq!(expired.downloaded_bytes, 5);
     }
 
     #[test]
@@ -3669,6 +4551,8 @@ mod tests {
                 total_bytes: None,
                 validator: None,
                 error: None,
+                retry_count: 0,
+                auto_offline: false,
                 control,
                 task_lock: Arc::new(tokio::sync::Mutex::new(())),
             },
@@ -3705,12 +4589,14 @@ mod tests {
         let backup_file = directory.join("downloads.json.bak");
         let mut record = persisted_download("paused", 7);
         record.validator = Some("\"stable\"".to_string());
+        record.retry_count = 2;
 
         persist_snapshot(&queue_file, std::slice::from_ref(&record)).unwrap();
         let restored = read_persisted_queue(&queue_file, &backup_file).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, record.id);
         assert_eq!(restored[0].validator, record.validator);
+        assert_eq!(restored[0].retry_count, 2);
 
         std::fs::write(&queue_file, b"{").unwrap();
         std::fs::write(&backup_file, serde_json::to_vec(&[record]).unwrap()).unwrap();
@@ -3729,6 +4615,10 @@ mod tests {
         let settings_file = directory.join("settings.json");
         let backup_file = queue_file.with_extension("json.bak");
         let record = persisted_download("paused", 7);
+        let mut old_record = serde_json::to_value(&record).unwrap();
+        old_record.as_object_mut().unwrap().remove("retryCount");
+        let old_record: PersistedDownload = serde_json::from_value(old_record).unwrap();
+        assert_eq!(old_record.retry_count, 0);
 
         std::fs::write(&queue_file, serde_json::to_vec(&[&record]).unwrap()).unwrap();
         assert_eq!(
@@ -3953,6 +4843,10 @@ mod tests {
             "observed only {} range requests",
             server.range_requests.load(Ordering::Acquire)
         );
+        assert_eq!(
+            server.identity_range_requests.load(Ordering::Acquire),
+            server.range_requests.load(Ordering::Acquire)
+        );
     }
 
     #[tokio::test]
@@ -3999,7 +4893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_http_dropped_segment_connections_fall_back_to_sequential_downloads() {
+    async fn local_http_dropped_segment_connections_retry_and_resume_the_range() {
         let _guard = http_test_guard();
         let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 61);
         let server =
@@ -4016,10 +4910,61 @@ mod tests {
         );
         assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
         assert!(server.range_requests.load(Ordering::Acquire) > 1);
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].retry_count,
+            1
+        );
     }
 
     #[tokio::test]
-    async fn local_http_forbidden_link_fails_without_completing_a_file() {
+    async fn local_http_stalled_segments_time_out_and_resume_after_retry() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 71);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::StallsSegmentBodies);
+        let test_download = TestDownload::new();
+        let task = start_test_download(&server, &test_download);
+
+        wait_for_retry_count(&test_download, 1).await;
+        server.slow.store(false, Ordering::Release);
+        task.await.unwrap();
+
+        assert_eq!(
+            test_download.status(),
+            "completed",
+            "download error: {:?}",
+            test_download.manager.entries.lock().unwrap()[&test_download.id].error
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(server.range_requests.load(Ordering::Acquire) > 5);
+    }
+
+    #[tokio::test]
+    async fn local_http_stalled_sequential_response_retries_after_timeout() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 77);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::StallsSequentialBody);
+        let test_download = TestDownload::new();
+        let task = start_test_download(&server, &test_download);
+
+        wait_for_retry_count(&test_download, 1).await;
+        server.slow.store(false, Ordering::Release);
+        task.await.unwrap();
+
+        assert_eq!(
+            test_download.status(),
+            "completed",
+            "download error: {:?}",
+            test_download.manager.entries.lock().unwrap()[&test_download.id].error
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].retry_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_http_forbidden_link_is_marked_expired_without_completing_a_file() {
         let _guard = http_test_guard();
         let server = LocalHttpServer::start(
             test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 63),
@@ -4029,7 +4974,7 @@ mod tests {
 
         start_test_download(&server, &test_download).await.unwrap();
 
-        assert_eq!(test_download.status(), "failed");
+        assert_eq!(test_download.status(), "link-expired");
         assert!(
             test_download.manager.entries.lock().unwrap()[&test_download.id]
                 .error
@@ -4040,7 +4985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_http_gone_link_fails_without_completing_a_file() {
+    async fn local_http_gone_link_is_marked_expired_without_completing_a_file() {
         let _guard = http_test_guard();
         let server = LocalHttpServer::start(
             test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 65),
@@ -4050,7 +4995,7 @@ mod tests {
 
         start_test_download(&server, &test_download).await.unwrap();
 
-        assert_eq!(test_download.status(), "failed");
+        assert_eq!(test_download.status(), "link-expired");
         assert!(
             test_download.manager.entries.lock().unwrap()[&test_download.id]
                 .error
@@ -4058,6 +5003,155 @@ mod tests {
                 .is_some_and(|error| !error.is_empty())
         );
         assert!(!test_download.final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn replacement_url_preserves_progress_when_size_and_validator_match() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 73);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
+        let test_download = TestDownload::new();
+        let ranges = segment_ranges(payload.len() as u64, super::MAX_SEGMENTS_PER_DOWNLOAD);
+        let old_url = "https://expired.example/payload.bin";
+        let old_state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: old_url.to_string(),
+            final_url: old_url.to_string(),
+            total_size: payload.len() as u64,
+            validator: Some("\"stable\"".to_string()),
+            segments: ranges
+                .iter()
+                .enumerate()
+                .map(|(index, (start, end))| SegmentPosition {
+                    start: *start,
+                    end: *end,
+                    position: if index == 0 { end + 1 } else { *start },
+                })
+                .collect(),
+        };
+        std::fs::write(&test_download.partial_path, vec![0; payload.len()]).unwrap();
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        persist_segment_resume_state(&sidecar, &old_state)
+            .await
+            .unwrap();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = old_url.to_string();
+            entry.status = "link-expired".to_string();
+            entry.downloaded_bytes = segment_progress(&old_state);
+            entry.total_bytes = Some(payload.len() as u64);
+            entry.validator = old_state.validator.clone();
+            entry.error = Some("Link expired".to_string());
+        }
+
+        let download =
+            prepare_download_url_update(&test_download.manager, &test_download.id, &server.url)
+                .await
+                .unwrap();
+
+        assert_eq!(download.url, server.url);
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].downloaded_bytes,
+            segment_progress(&old_state)
+        );
+        let updated_state = read_segment_resume_state(&sidecar).unwrap().unwrap();
+        assert_eq!(updated_state.url, server.url);
+        assert_eq!(updated_state.final_url, server.url);
+    }
+
+    #[tokio::test]
+    async fn replacement_url_restarts_when_validator_changes() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 75);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
+        let test_download = TestDownload::new();
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        let ranges = segment_ranges(payload.len() as u64, super::MAX_SEGMENTS_PER_DOWNLOAD);
+        let old_state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: "https://expired.example/payload.bin".to_string(),
+            final_url: "https://expired.example/payload.bin".to_string(),
+            total_size: payload.len() as u64,
+            validator: Some("\"old\"".to_string()),
+            segments: ranges
+                .iter()
+                .map(|(start, end)| SegmentPosition {
+                    start: *start,
+                    end: *end,
+                    position: end + 1,
+                })
+                .collect(),
+        };
+        std::fs::write(&test_download.partial_path, vec![0; payload.len()]).unwrap();
+        persist_segment_resume_state(&sidecar, &old_state)
+            .await
+            .unwrap();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = old_state.url.clone();
+            entry.status = "link-expired".to_string();
+            entry.downloaded_bytes = payload.len() as u64;
+            entry.total_bytes = Some(payload.len() as u64);
+            entry.validator = old_state.validator.clone();
+        }
+
+        prepare_download_url_update(&test_download.manager, &test_download.id, &server.url)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].downloaded_bytes,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&test_download.partial_path)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn disk_space_check_accounts_for_replaced_partial_files() {
+        assert!(enough_disk_space(100, 50, 50));
+        assert!(!enough_disk_space(101, 50, 50));
+        assert!(enough_disk_space(0, 0, 0));
+    }
+
+    #[test]
+    fn disk_space_preflight_rejects_an_impossible_allocation() {
+        let test_download = TestDownload::new();
+        let error = ensure_disk_space(&test_download.partial_path, u64::MAX, false).unwrap_err();
+
+        assert!(error.starts_with("Not enough disk space:"));
+    }
+
+    #[tokio::test]
+    async fn insufficient_disk_space_preserves_partial_download_state() {
+        let test_download = TestDownload::new();
+        std::fs::write(&test_download.partial_path, b"saved bytes").unwrap();
+
+        finish_failed(
+            &TestUpdateSink,
+            &test_download.manager,
+            DownloadFailure {
+                id: &test_download.id,
+                filename: "payload.bin",
+                path: &test_download.partial_path,
+                downloaded_bytes: 11,
+                total_bytes: Some(100),
+                message: "Not enough disk space: need 100 bytes.".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read(&test_download.partial_path).unwrap(),
+            b"saved bytes"
+        );
     }
 
     #[tokio::test]
@@ -4391,6 +5485,7 @@ pub fn run() {
             resume_download,
             cancel_download,
             retry_download,
+            update_download_url,
             open_download_location,
             list_downloads,
             get_download_settings,

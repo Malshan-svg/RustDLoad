@@ -533,7 +533,8 @@ kbd {
 }
 
 .file-status-icon.completed { color: var(--complete); }
-.file-status-icon.failed { color: var(--error); }
+.file-status-icon.failed,
+.file-status-icon.link-expired { color: var(--error); }
 .file-status-icon.queued,
 .file-status-icon.paused,
 .file-status-icon.cancelled { color: var(--queued); }
@@ -597,7 +598,8 @@ kbd {
 }
 
 .progress-fill.completed { background: var(--complete); }
-.progress-fill.failed { background: var(--error); }
+.progress-fill.failed,
+.progress-fill.link-expired { background: var(--error); }
 .progress-fill.paused,
 .progress-fill.queued,
 .progress-fill.cancelled { background: var(--queued); }
@@ -621,7 +623,8 @@ kbd {
 }
 
 .status-label.completed { color: var(--complete); }
-.status-label.failed { color: var(--error); }
+.status-label.failed,
+.status-label.link-expired { color: var(--error); }
 .status-label.paused,
 .status-label.queued,
 .status-label.cancelled { color: var(--queued); }

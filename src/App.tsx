@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
-type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "cancelled";
+type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "link-expired" | "cancelled";
 type DownloadFilter = "all" | "downloading" | "queued" | "completed";
 type DownloadAction = "pause" | "resume" | "cancel" | "retry";
 type DownloadSort = "recent" | "name" | "size" | "progress";
@@ -49,7 +49,7 @@ const filters: { id: DownloadFilter; label: string; icon: IconName }[] = [
   { id: "completed", label: "Completed", icon: "check" },
 ];
 
-const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "failed", "completed", "cancelled"];
+const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "link-expired", "failed", "completed", "cancelled"];
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -146,6 +146,7 @@ function isActive(status: DownloadStatus): boolean {
 function statusLabel(status: DownloadStatus): string {
   if (status === "completed") return "Complete";
   if (status === "failed") return "Failed";
+  if (status === "link-expired") return "Link expired";
   if (status === "cancelled") return "Cancelled";
   if (status === "paused") return "Paused";
   if (status === "queued") return "Queued";
@@ -365,6 +366,23 @@ function App() {
       else if (action === "cancel") await invoke("cancel_download", { id: download.id });
       else if (download.url) await invoke("retry_download", { id: download.id });
       else throw new Error("The original link is unavailable, so this download cannot be retried.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    } finally {
+      setBusyActionId(null);
+    }
+  }
+
+  async function updateExpiredDownloadUrl(download: Download) {
+    const newUrl = window.prompt("Enter the refreshed download URL", download.url ?? "");
+    if (!newUrl?.trim() || busyActionId) return;
+    setBusyActionId(download.id);
+    setErrorMessage("");
+    setNoticeMessage("");
+    try {
+      await invoke("update_download_url", { id: download.id, newUrl: newUrl.trim() });
+      setDownloads(await invoke<Download[]>("list_downloads"));
+      setNoticeMessage("Updated link; download resumed.");
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
@@ -699,7 +717,7 @@ function App() {
                               {eta !== null && eta >= 0 ? formatEta(eta) : "—"}
                             </td>
                             <td>
-                              <span className={`status-label ${download.status}`}>
+                              <span className={`status-label ${download.status}`} title={download.error ?? undefined}>
                                 <span className="status-dot" />
                                 {statusLabel(download.status)}
                               </span>
@@ -772,6 +790,12 @@ function App() {
                           Start / Resume
                         </button>
                       )}
+                      {download.status === "link-expired" && (
+                        <button onClick={() => void updateExpiredDownloadUrl(download)} role="menuitem" type="button">
+                          <Icon name="retry" />
+                          Update expired URL
+                        </button>
+                      )}
                       {download.url && (download.status === "failed" || download.status === "cancelled") && (
                         <button onClick={() => runAction("retry")} role="menuitem" type="button">
                           <Icon name="retry" />
@@ -790,7 +814,7 @@ function App() {
                           Cancel
                         </button>
                       )}
-                      {(isActive(download.status) || download.status === "failed" || download.status === "cancelled") && (
+                      {(isActive(download.status) || download.status === "failed" || download.status === "link-expired" || download.status === "cancelled") && (
                         <div className="context-menu-divider" role="separator" />
                       )}
                       {download.url && (

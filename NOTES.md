@@ -16,6 +16,7 @@
 ## Dependencies
 
 - `tauri-plugin-dialog` and `@tauri-apps/plugin-dialog`: provide the native save dialog for choosing each download's destination.
+- `fs2`: provides cross-platform available-disk-space checks before allocating or extending download files.
 
 ## Work log
 
@@ -25,6 +26,9 @@
 - Phase 1, task 2 adds local HTTP server modes and coverage for ignored ranges, malformed ranges, changed validators, short range bodies, dropped segment connections, slow/stalling transfers, and 403/410 responses. The HTML-error fixture is verified to return status 200 and `text/html`; downloader classification is deferred to task 6, where final-file integrity handling is introduced.
 - No HTTP server dependency was added; the existing in-process TCP fixture provides the required local-only wire behavior.
 - Task 2 validation: all 10 targeted local HTTP tests passed; the full Rust suite passed with 42 tests, and formatting, strict Clippy, whitespace checks, and the frontend build passed.
+- Phase 1, task 3 adds identity-encoded range requests, 15-second stalled-body detection, per-transfer exponential retry limits with a persisted retry count, automatic Offline pause/retry behavior, Link expired status and replacement-URL validation, and available-space checks before known-size allocation. Disk-full and insufficient-space failures preserve partial data and segmented checkpoints.
+- Replacement URLs preserve progress only when range probing succeeds and both size and validator match; otherwise the partial is reset before starting from the new URL.
+- Task 3 validation: segmented and sequential stall tests, transient range retry, offline pause/resume, retry-cap, replacement-URL match/mismatch, disk-space preflight/preservation, and expired-link tests passed. The full Rust suite passed with 51 tests; strict Clippy, formatting, whitespace checks, and the frontend build passed.
 - The remainder of Phase 1 is not complete. Continue in the provided task order and do not begin Phase 2 until Phase 1 is fully validated.
 - No internet-hosted test files or real downloads have been used during validation.
 
@@ -34,4 +38,11 @@
 - [ ] Test a server that ignores Range requests.
 - [ ] Test offline/online switching and sleep/wake recovery.
 - [ ] Test duplicate URL handling and an expired link.
+- [ ] Update an expired link with matching and changed validators; verify progress is retained or reset appropriately.
+- [ ] Verify insufficient free space leaves partial files and resume metadata intact.
 - [ ] Test the Settings screen and saved concurrency limit.
+
+## Known limitations
+
+- Offline recovery is request-driven rather than based on an operating-system network-change event; active transfers detect connection/timeouts, pause as Offline, and retry with backoff.
+- The HTTP 200 HTML-error fixture is covered at the wire level, but classifying that body as an error is part of Phase 1 task 6 and remains pending.

@@ -11,6 +11,9 @@ A free, open-source download manager built with Rust and Tauri.
 - Avoid overwriting files by choosing a unique filename.
 - Pause, resume, and cancel active downloads.
 - Retry failed or cancelled downloads at their saved destination without reopening the save dialog.
+- Retry transient network failures with capped exponential backoff; pause with an Offline reason on connection failures and retry automatically when connectivity returns.
+- Detect stalled responses, preserve durable progress on disk-full errors, and check available disk space before allocating known-size downloads.
+- Mark HTTP 403/410 responses as expired links; supply a replacement URL to resume only when the server size and validator still match.
 - Right-click a download to start/resume or pause it, retry it, copy its URL, or open its destination folder.
 - Choose a persistent maximum of 1–10 concurrent downloads (default: 3); additional jobs wait in the queue.
 - Apply limit changes without interrupting running transfers. When lowering the limit, queued jobs wait until the active count is below the new limit.
