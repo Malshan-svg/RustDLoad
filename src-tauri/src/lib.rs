@@ -1122,6 +1122,52 @@ fn sanitize_header_filename(value: &str) -> String {
     sanitize_filename(leaf)
 }
 
+fn text_response_error(filename: &str, content_type: Option<&str>) -> Option<String> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|part| part.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "txt"
+            | "text"
+            | "html"
+            | "htm"
+            | "csv"
+            | "json"
+            | "xml"
+            | "md"
+            | "markdown"
+            | "css"
+            | "js"
+            | "mjs"
+            | "svg"
+            | "yaml"
+            | "yml"
+            | "log"
+            | "ini"
+            | "toml"
+            | "rst"
+    ) {
+        return None;
+    }
+
+    let media_type = content_type?
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_text = media_type.starts_with("text/")
+        || media_type == "application/json"
+        || media_type.ends_with("+json")
+        || media_type == "application/xml"
+        || media_type.ends_with("+xml");
+    is_text
+        .then(|| format!("The server returned {media_type} content instead of the requested file."))
+}
+
 fn split_header_parameters(value: &str) -> Vec<&str> {
     let mut parameters = Vec::new();
     let mut start = 0;
@@ -1913,6 +1959,24 @@ async fn finalize_file_with_policy(
         .map_err(|error| format!("Could not finalize the download: {error}"))
 }
 
+async fn verify_download_size(path: &Path, expected: Option<u64>) -> Result<u64, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("Could not verify the completed download: {error}"))?;
+    if !metadata.is_file() {
+        return Err("The completed download is not a regular file.".to_string());
+    }
+    let actual = metadata.len();
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        return Err(format!(
+            "The downloaded byte count did not match the server response (expected {expected}, received {actual})."
+        ));
+    }
+    Ok(actual)
+}
+
 fn download_file_exists_policy(
     manager: &DownloadManager,
     id: &str,
@@ -1997,6 +2061,14 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
             return SegmentWorkerResult::Invalid;
         }
     };
+
+    let response_content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if let Some(error) = text_response_error(&filename, response_content_type) {
+        return SegmentWorkerResult::Failed(error);
+    }
 
     let content_range = response
         .headers()
@@ -2349,6 +2421,13 @@ async fn try_segmented_download(
         {
             return Ok(SegmentedAttempt::Rename(destination, filename));
         }
+    }
+    let response_content_type = probe
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if let Some(error) = text_response_error(filename, response_content_type) {
+        return Err(error);
     }
     let probe_range = probe
         .headers()
@@ -2770,6 +2849,23 @@ async fn download_file_inner(
             .await
             {
                 Ok(SegmentedAttempt::Completed(total)) => {
+                    let actual = match verify_download_size(&path, Some(total)).await {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            finish_failed!(
+                                &app,
+                                &manager,
+                                &id,
+                                &filename,
+                                &path,
+                                total,
+                                Some(total),
+                                error,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                     let policy = match download_file_exists_policy(&manager, &id) {
                         Ok(policy) => policy,
                         Err(error) => {
@@ -2779,7 +2875,7 @@ async fn download_file_inner(
                                 &id,
                                 &filename,
                                 &path,
-                                total,
+                                actual,
                                 Some(total),
                                 error,
                             )
@@ -2798,8 +2894,8 @@ async fn download_file_inner(
                                 &id,
                                 &filename,
                                 "completed",
-                                total,
-                                Some(total),
+                                actual,
+                                Some(actual),
                                 None,
                             );
                         }
@@ -2810,8 +2906,8 @@ async fn download_file_inner(
                                 &id,
                                 &filename,
                                 &path,
-                                total,
-                                Some(total),
+                                actual,
+                                Some(actual),
                                 error,
                             )
                             .await;
@@ -3087,6 +3183,24 @@ async fn download_file_inner(
                 }
             }
         }
+        let response_content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if let Some(error) = text_response_error(&filename, response_content_type) {
+            finish_failed!(
+                &app,
+                &manager,
+                &id,
+                &filename,
+                &path,
+                offset,
+                total_bytes,
+                error,
+            )
+            .await;
+            return;
+        }
 
         let status = response.status();
         let mut range_end = None;
@@ -3359,8 +3473,8 @@ async fn download_file_inner(
         }
 
         if paused {
-            let actual_bytes = match tokio::fs::metadata(&path).await {
-                Ok(metadata) => metadata.len(),
+            let actual_bytes = match verify_download_size(&path, None).await {
+                Ok(actual_bytes) => actual_bytes,
                 Err(error) => {
                     finish_failed!(
                         &app,
@@ -3441,8 +3555,8 @@ async fn download_file_inner(
             return;
         }
 
-        let actual_bytes = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata.len(),
+        let actual_bytes = match verify_download_size(&path, None).await {
+            Ok(actual_bytes) => actual_bytes,
             Err(error) => {
                 finish_failed!(
                     &app,
@@ -3452,7 +3566,7 @@ async fn download_file_inner(
                     &path,
                     downloaded_bytes,
                     total_bytes,
-                    format!("Could not verify the completed download: {error}"),
+                    error,
                 )
                 .await;
                 return;
@@ -3479,20 +3593,23 @@ async fn download_file_inner(
                 continue;
             }
         }
-        if total_bytes.is_some_and(|total| total != actual_bytes) {
-            finish_failed!(
-                &app,
-                &manager,
-                &id,
-                &filename,
-                &path,
-                actual_bytes,
-                total_bytes,
-                "The downloaded byte count did not match the server response.".to_string(),
-            )
-            .await;
-            return;
-        }
+        let actual_bytes = match verify_download_size(&path, total_bytes).await {
+            Ok(actual_bytes) => actual_bytes,
+            Err(error) => {
+                finish_failed!(
+                    &app,
+                    &manager,
+                    &id,
+                    &filename,
+                    &path,
+                    actual_bytes,
+                    total_bytes,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
         let policy = match download_file_exists_policy(&manager, &id) {
             Ok(policy) => policy,
             Err(error) => {
@@ -4238,9 +4355,9 @@ mod tests {
         read_download_settings, read_max_concurrent_downloads, read_persisted_queue,
         read_segment_resume_state, reconcile_persisted_status, restore_download_manager,
         sanitize_filename, segment_progress, segment_ranges, segment_sidecar_path,
-        suggested_destination, valid_range_probe, valid_segment_response,
+        suggested_destination, text_response_error, valid_range_probe, valid_segment_response,
         valid_segment_resume_state, validate_max_concurrent_downloads, validate_transition,
-        validators_compatible, wait_before_retry,
+        validators_compatible, verify_download_size, wait_before_retry,
     };
     use std::{
         io::{Read, Write},
@@ -4752,6 +4869,37 @@ mod tests {
             filename_from_content_disposition("attachment; filename*=UTF-8'en'foo%252Fbar.txt")
                 .as_deref(),
             Some("foo%2Fbar.txt")
+        );
+    }
+
+    #[test]
+    fn text_error_content_is_rejected_only_when_the_filename_is_not_text() {
+        assert!(
+            text_response_error("archive.zip", Some("text/html; charset=utf-8"))
+                .unwrap()
+                .contains("text/html")
+        );
+        assert!(text_response_error("readme.txt", Some("text/plain")).is_none());
+        assert!(text_response_error("archive.zip", Some("application/octet-stream")).is_none());
+        assert!(text_response_error("archive.zip", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn final_size_verification_rejects_mismatched_downloads() {
+        let test_download = TestDownload::new();
+        std::fs::write(&test_download.partial_path, b"valid").unwrap();
+
+        assert_eq!(
+            verify_download_size(&test_download.partial_path, Some(5))
+                .await
+                .unwrap(),
+            5
+        );
+        assert!(
+            verify_download_size(&test_download.partial_path, Some(6))
+                .await
+                .unwrap_err()
+                .contains("expected 6")
         );
     }
 
@@ -5977,7 +6125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_http_html_error_fixture_returns_a_success_status_and_html_type() {
+    async fn local_http_html_error_page_is_not_marked_as_a_completed_download() {
         let _guard = http_test_guard();
         let server = LocalHttpServer::start(
             test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 67),
@@ -5995,6 +6143,18 @@ mod tests {
                 .is_some_and(|value| value.starts_with("text/html"))
         );
         assert!(response.text().await.unwrap().contains("Temporary error"));
+
+        let test_download = TestDownload::new();
+        start_test_download(&server, &test_download).await.unwrap();
+
+        assert_eq!(test_download.status(), "failed");
+        assert!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("text/html"))
+        );
+        assert!(!test_download.final_path.exists());
     }
 
     #[tokio::test]

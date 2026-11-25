@@ -37,6 +37,8 @@
 - Phase 1, task 5 adds sanitized URL and `Content-Disposition` filenames: path separators and traversal markers cannot escape the selected folder, reserved Windows device names are prefixed, trailing dots/spaces are removed, and long names are shortened safely. An automatic URL-derived name may be replaced by the server's sanitized filename; an existing destination forces a unique name and moves any segmented checkpoint with it.
 - The persisted file-exists setting now supports keeping both files (default), replacing the existing file only after the new transfer is complete, or skipping a destination that already exists. The policy is stored in settings and on each download record so retries/restores retain behavior; legacy settings and queue records default safely to rename.
 - Task 5 validation: URL/header filename normalization, local HTTP filename adoption, checkpoint relocation, existing-file collision handling, overwrite/skip finalization, and settings migration/persistence tests passed. All 59 Rust tests, strict Clippy, formatting/whitespace checks, and the frontend production build passed.
+- Phase 1, task 6 verifies the completed partial file is regular and exactly matches the expected total size before finalizing both sequential and segmented downloads. Responses labeled as HTML/text are rejected for non-text filenames with an explicit error rather than being marked completed; ordinary text filenames remain allowed.
+- Task 6's local HTTP regression now exercises the previously deferred status-200 HTML error through the downloader, not just at the wire level. Focused classification and size-verification tests passed; run the full suite and checks before committing.
 
 ## Manual test checklist
 

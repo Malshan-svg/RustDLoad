@@ -8,6 +8,7 @@ A free, open-source download manager built with Rust and Tauri.
 - Prompt for a destination with the native save dialog before enqueueing each new download; the URL-derived filename and system Downloads folder are used as the default.
 - Sanitize URL and server-provided filenames, including path separators, Windows device names, trailing dots/spaces, and excessive lengths.
 - Resume partial files beside the chosen destination across app restarts using a versioned `.rdl` sidecar.
+- Verify completed files against the server-reported size and reject HTML/text responses masquerading as binary downloads.
 - Show live byte progress and completion or error status.
 - Choose whether existing files are renamed, replaced after a successful transfer, or cause the new download to be skipped.
 - Pause, resume, and cancel active downloads.
