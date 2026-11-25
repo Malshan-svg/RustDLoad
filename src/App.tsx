@@ -8,6 +8,7 @@ type DownloadFilter = "all" | "active" | "completed";
 type DownloadAction = "pause" | "resume" | "cancel" | "retry";
 type DownloadSort = "recent" | "name" | "size" | "progress";
 type DownloadGrouping = "none" | "status";
+type AppPage = "downloads" | "settings";
 
 type Download = {
   id: string;
@@ -21,6 +22,7 @@ type Download = {
 
 type DownloadUpdate = Omit<Download, "url">;
 type StartedDownload = Pick<Download, "id" | "filename">;
+type DownloadSettings = { maxConcurrentDownloads: number };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
 
@@ -116,6 +118,11 @@ function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isStarting, setIsStarting] = useState(false);
   const [busyActionId, setBusyActionId] = useState<string | null>(null);
+  const [page, setPage] = useState<AppPage>("downloads");
+  const [maxConcurrentDownloads, setMaxConcurrentDownloads] = useState(3);
+  const [concurrencyDraft, setConcurrencyDraft] = useState("3");
+  const [settingsError, setSettingsError] = useState("");
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -158,6 +165,11 @@ function App() {
             const currentIds = new Set(current.map((download) => download.id));
             return [...current, ...restored.filter((download) => !currentIds.has(download.id))];
           });
+        }
+        const settings = await invoke<DownloadSettings>("get_download_settings");
+        if (!disposed) {
+          setMaxConcurrentDownloads(settings.maxConcurrentDownloads);
+          setConcurrencyDraft(String(settings.maxConcurrentDownloads));
         }
       } catch (error) {
         setErrorMessage(`Could not initialize downloads: ${String(error)}`);
@@ -276,6 +288,27 @@ function App() {
     }
   }
 
+  async function saveSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const limit = Number(concurrencyDraft);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10) {
+      setSettingsError("Choose a whole number between 1 and 10.");
+      return;
+    }
+
+    setSettingsError("");
+    setIsSavingSettings(true);
+    try {
+      const saved = await invoke<DownloadSettings>("set_max_concurrent_downloads", { limit });
+      setMaxConcurrentDownloads(saved.maxConcurrentDownloads);
+      setConcurrencyDraft(String(saved.maxConcurrentDownloads));
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setIsSavingSettings(false);
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -299,7 +332,10 @@ function App() {
               <button
                 className={`nav-item ${filter === item.id ? "selected" : ""}`}
                 key={item.id}
-                onClick={() => setFilter(item.id)}
+                onClick={() => {
+                  setPage("downloads");
+                  setFilter(item.id);
+                }}
                 type="button"
               >
                 <span className={`nav-icon nav-icon-${item.id}`} aria-hidden="true">
@@ -310,13 +346,21 @@ function App() {
               </button>
             );
           })}
+          <button
+            className={`nav-item ${page === "settings" ? "selected" : ""}`}
+            onClick={() => setPage("settings")}
+            type="button"
+          >
+            <span className="nav-icon" aria-hidden="true">⚙</span>
+            <span>Settings</span>
+          </button>
         </nav>
 
         <div className="sidebar-footer">
           <span className="engine-indicator" />
           <div>
             <div className="engine-title">Download engine</div>
-            <div className="engine-caption">Up to 3 downloads at once</div>
+            <div className="engine-caption">Up to {maxConcurrentDownloads} downloads at once</div>
           </div>
           <span className="engine-state">READY</span>
         </div>
@@ -327,7 +371,7 @@ function App() {
           <div className="breadcrumb">
             <span>Workspace</span>
             <span className="breadcrumb-divider">/</span>
-            <strong>Downloads</strong>
+            <strong>{page === "settings" ? "Settings" : "Downloads"}</strong>
           </div>
           <div className="open-source-tag">
             <span className="tag-dot" />
@@ -335,7 +379,50 @@ function App() {
           </div>
         </header>
 
-        <section className="content">
+        <section className={`content ${page === "settings" ? "settings-content" : ""}`}>
+          {page === "settings" ? (
+            <>
+              <div className="page-heading">
+                <div>
+                  <div className="eyebrow">PREFERENCES</div>
+                  <h1>Settings</h1>
+                  <p className="page-subtitle">Configure how RustDLoad manages your transfers.</p>
+                </div>
+              </div>
+
+              <form className="settings-card" onSubmit={saveSettings}>
+                <div className="settings-copy">
+                  <h2>Concurrent downloads</h2>
+                  <p>Choose how many downloads may transfer at the same time. The range is 1–10.</p>
+                </div>
+                <label className="settings-field" htmlFor="max-concurrent-downloads">
+                  <span>Maximum active transfers</span>
+                  <input
+                    id="max-concurrent-downloads"
+                    max={10}
+                    min={1}
+                    onChange={(event) => setConcurrencyDraft(event.currentTarget.value)}
+                    step={1}
+                    type="number"
+                    value={concurrencyDraft}
+                    required
+                  />
+                </label>
+                <p className="settings-note">
+                  Lowering this limit won’t stop running downloads; queued downloads wait until capacity is available.
+                </p>
+                {settingsError && <p className="settings-error" role="alert">{settingsError}</p>}
+                <button className="start-button settings-save" disabled={isSavingSettings} type="submit">
+                  {isSavingSettings ? "Saving…" : "Save settings"}
+                </button>
+              </form>
+
+              <footer className="content-footer">
+                <span>Current limit: {maxConcurrentDownloads} concurrent {maxConcurrentDownloads === 1 ? "download" : "downloads"}</span>
+              </footer>
+            </>
+          ) : (
+            <>
           <div className="page-heading">
             <div>
               <div className="eyebrow">YOUR LIBRARY</div>
@@ -375,7 +462,7 @@ function App() {
               <span className="hint-separator">·</span>
               HTTP and HTTPS links supported
               <span className="hint-separator">·</span>
-              Up to 3 run at once
+              Up to {maxConcurrentDownloads} run at once
             </div>
           </form>
 
@@ -574,6 +661,8 @@ function App() {
             <span className="footer-separator">·</span>
             <span>Downloads are stored locally on your device</span>
           </footer>
+            </>
+          )}
         </section>
       </main>
     </div>

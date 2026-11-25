@@ -260,6 +260,76 @@ button {
   margin: 0 auto;
 }
 
+.settings-content {
+  max-width: 860px;
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 23px;
+  border: 1px solid #303730;
+  border-radius: 11px;
+  background: linear-gradient(125deg, rgba(28, 34, 28, 0.97), rgba(23, 27, 23, 0.98));
+}
+
+.settings-copy h2 {
+  color: #dfe4dc;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-copy p,
+.settings-note {
+  color: #858d82;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.settings-copy p {
+  margin-top: 6px;
+}
+
+.settings-field {
+  display: flex;
+  max-width: 360px;
+  flex-direction: column;
+  gap: 8px;
+  color: #cbd2c6;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.settings-field input {
+  height: 40px;
+  padding: 0 11px;
+  border: 1px solid #363e35;
+  border-radius: 7px;
+  outline: 0;
+  background: #131613;
+  color: #e6ebe3;
+  font-size: 12px;
+}
+
+.settings-field input:focus {
+  border-color: #789b5f;
+}
+
+.settings-note {
+  padding-top: 15px;
+  border-top: 1px solid #303730;
+}
+
+.settings-error {
+  color: #e7aaa1;
+  font-size: 11px;
+}
+
+.settings-save {
+  align-self: flex-start;
+}
+
 .page-heading {
   display: flex;
   align-items: flex-end;
