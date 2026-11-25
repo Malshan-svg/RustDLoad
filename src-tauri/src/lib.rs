@@ -2931,12 +2931,23 @@ mod tests {
 
     static HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn http_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        HTTP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ServerBehavior {
         SupportsRanges,
         IgnoresRanges,
         MalformedSegmentRanges,
         ChangesValidator,
+        ShortRangeBodies,
+        DropsSegmentConnections,
+        HtmlErrorPage,
+        Forbidden,
+        Gone,
         SlowRanges,
         SlowStreamingRanges,
     }
@@ -3064,33 +3075,60 @@ mod tests {
         }
         let is_probe = range == Some((0, 0));
         let ignores_range = behavior == ServerBehavior::IgnoresRanges;
-        let (status, response_body, content_range) = match range {
-            Some((start, end)) if !ignores_range && end < body.len() as u64 && start <= end => {
-                let response_range =
-                    if behavior == ServerBehavior::MalformedSegmentRanges && !is_probe {
-                        format!("bytes {}-{}/{}", start + 1, end + 1, body.len())
-                    } else {
-                        format!("bytes {start}-{end}/{}", body.len())
-                    };
-                let content = &body[start as usize..=end as usize];
-                (206, content.to_vec(), Some(response_range))
-            }
-            _ => (200, body.as_ref().clone(), None),
+        let (status, mut response_body, content_range) = match behavior {
+            ServerBehavior::HtmlErrorPage => (
+                200,
+                b"<!doctype html><title>Temporary error</title>".to_vec(),
+                None,
+            ),
+            ServerBehavior::Forbidden => (403, b"Forbidden".to_vec(), None),
+            ServerBehavior::Gone => (410, b"Link expired".to_vec(), None),
+            _ => match range {
+                Some((start, end)) if !ignores_range && end < body.len() as u64 && start <= end => {
+                    let response_range =
+                        if behavior == ServerBehavior::MalformedSegmentRanges && !is_probe {
+                            format!("bytes {}-{}/{}", start + 1, end + 1, body.len())
+                        } else {
+                            format!("bytes {start}-{end}/{}", body.len())
+                        };
+                    let content = &body[start as usize..=end as usize];
+                    (206, content.to_vec(), Some(response_range))
+                }
+                _ => (200, body.as_ref().clone(), None),
+            },
         };
+        let short_range_body =
+            behavior == ServerBehavior::ShortRangeBodies && range.is_some() && !is_probe;
+        if short_range_body {
+            response_body.truncate((response_body.len() / 2).max(1));
+        }
+        let drops_segment_connection =
+            behavior == ServerBehavior::DropsSegmentConnections && range.is_some() && !is_probe;
         let etag = if behavior == ServerBehavior::ChangesValidator && range.is_some() && !is_probe {
             "\"changed\""
         } else {
             "\"stable\""
         };
-        let reason = if status == 206 {
-            "Partial Content"
-        } else {
-            "OK"
+        let reason = match status {
+            206 => "Partial Content",
+            403 => "Forbidden",
+            410 => "Gone",
+            _ => "OK",
         };
         let mut headers = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\n",
-            response_body.len()
+            if drops_segment_connection {
+                content_range
+                    .as_ref()
+                    .and_then(|_| range.map(|(start, end)| end - start + 1))
+                    .unwrap_or(response_body.len() as u64) as usize
+            } else {
+                response_body.len()
+            }
         );
+        if behavior == ServerBehavior::HtmlErrorPage {
+            headers.push_str("Content-Type: text/html\r\n");
+        }
         if let Some(content_range) = content_range {
             headers.push_str(&format!("Content-Range: {content_range}\r\n"));
         }
@@ -3112,6 +3150,10 @@ mod tests {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
+            return;
+        }
+        if drops_segment_connection {
+            let _ = stream.write_all(&response_body[..response_body.len() / 2]);
             return;
         }
         let _ = stream.write_all(&response_body);
@@ -3486,7 +3528,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_resumes_to_the_saved_destination() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(64 * 1024);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
         let test_download = TestDownload::new();
@@ -3764,7 +3806,7 @@ mod tests {
 
     #[tokio::test]
     async fn chosen_destination_and_partial_resume_survive_restart() {
-        let _http_guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _http_guard = http_test_guard();
         let root = std::env::temp_dir().join(format!("rustdload-resume-{}", uuid::Uuid::new_v4()));
         let chosen_directory = root.join("chosen-folder");
         std::fs::create_dir_all(&chosen_directory).unwrap();
@@ -3897,7 +3939,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_range_server_writes_exact_bytes_to_preallocated_file() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 37);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
         let test_download = TestDownload::new();
@@ -3915,7 +3957,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_invalid_range_servers_fall_back_to_sequential_downloads() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         for behavior in [
             ServerBehavior::IgnoresRanges,
             ServerBehavior::MalformedSegmentRanges,
@@ -3938,8 +3980,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_http_short_range_bodies_fall_back_to_sequential_downloads() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 59);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::ShortRangeBodies);
+        let test_download = TestDownload::new();
+
+        start_test_download(&server, &test_download).await.unwrap();
+
+        assert_eq!(
+            test_download.status(),
+            "completed",
+            "download error: {:?}",
+            test_download.manager.entries.lock().unwrap()[&test_download.id].error
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(server.range_requests.load(Ordering::Acquire) > 1);
+    }
+
+    #[tokio::test]
+    async fn local_http_dropped_segment_connections_fall_back_to_sequential_downloads() {
+        let _guard = http_test_guard();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 61);
+        let server =
+            LocalHttpServer::start(payload.clone(), ServerBehavior::DropsSegmentConnections);
+        let test_download = TestDownload::new();
+
+        start_test_download(&server, &test_download).await.unwrap();
+
+        assert_eq!(
+            test_download.status(),
+            "completed",
+            "download error: {:?}",
+            test_download.manager.entries.lock().unwrap()[&test_download.id].error
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(server.range_requests.load(Ordering::Acquire) > 1);
+    }
+
+    #[tokio::test]
+    async fn local_http_forbidden_link_fails_without_completing_a_file() {
+        let _guard = http_test_guard();
+        let server = LocalHttpServer::start(
+            test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 63),
+            ServerBehavior::Forbidden,
+        );
+        let test_download = TestDownload::new();
+
+        start_test_download(&server, &test_download).await.unwrap();
+
+        assert_eq!(test_download.status(), "failed");
+        assert!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id]
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty())
+        );
+        assert!(!test_download.final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn local_http_gone_link_fails_without_completing_a_file() {
+        let _guard = http_test_guard();
+        let server = LocalHttpServer::start(
+            test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 65),
+            ServerBehavior::Gone,
+        );
+        let test_download = TestDownload::new();
+
+        start_test_download(&server, &test_download).await.unwrap();
+
+        assert_eq!(test_download.status(), "failed");
+        assert!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id]
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty())
+        );
+        assert!(!test_download.final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn local_http_html_error_fixture_returns_a_success_status_and_html_type() {
+        let _guard = http_test_guard();
+        let server = LocalHttpServer::start(
+            test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 67),
+            ServerBehavior::HtmlErrorPage,
+        );
+
+        let response = reqwest::get(&server.url).await.unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html"))
+        );
+        assert!(response.text().await.unwrap().contains("Temporary error"));
+    }
+
+    #[tokio::test]
     async fn local_http_download_can_pause_during_range_probe_and_resume() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(8 * 1024 * 1024);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowRanges);
         let test_download = TestDownload::new();
@@ -3965,7 +4109,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_segmented_pause_preserves_all_progress_and_resumes() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(8 * 1024 * 1024);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowStreamingRanges);
         let test_download = TestDownload::new();
@@ -4012,7 +4156,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_segmented_download_restores_sidecar_and_only_requests_missing_ranges() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(8 * 1024 * 1024);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowStreamingRanges);
         let test_download = TestDownload::new();
@@ -4091,7 +4235,7 @@ mod tests {
 
     #[tokio::test]
     async fn segmented_resume_restarts_from_zero_when_validator_changes() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 19);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
         let test_download = TestDownload::new();
@@ -4174,7 +4318,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_download_can_be_cancelled_during_range_probe() {
-        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let _guard = http_test_guard();
         let server =
             LocalHttpServer::start(test_payload(8 * 1024 * 1024), ServerBehavior::SlowRanges);
         let test_download = TestDownload::new();

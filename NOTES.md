@@ -22,6 +22,9 @@
 - Phase 1, task 1 is complete locally: segmented downloads now write directly into a preallocated partial file and persist atomic `.rdl` resume sidecars with per-range positions, URL, final URL, size, and validator. Resume requests only unfinished ranges; mismatched metadata or validators restart safely, and invalid or unsupported ranges fall back to sequential downloading.
 - Queue and settings persistence now write versioned formats while accepting legacy queue arrays and settings objects. Application exit pauses active downloads, waits up to 10 seconds for checkpointing, persists the queue, then exits.
 - Task 1 verification: the focused interrupted-download recovery test passed; all 37 Rust tests passed; Rust formatting, strict Clippy, whitespace checks, and the frontend production build passed.
+- Phase 1, task 2 adds local HTTP server modes and coverage for ignored ranges, malformed ranges, changed validators, short range bodies, dropped segment connections, slow/stalling transfers, and 403/410 responses. The HTML-error fixture is verified to return status 200 and `text/html`; downloader classification is deferred to task 6, where final-file integrity handling is introduced.
+- No HTTP server dependency was added; the existing in-process TCP fixture provides the required local-only wire behavior.
+- Task 2 validation: all 10 targeted local HTTP tests passed; the full Rust suite passed with 42 tests, and formatting, strict Clippy, whitespace checks, and the frontend build passed.
 - The remainder of Phase 1 is not complete. Continue in the provided task order and do not begin Phase 2 until Phase 1 is fully validated.
 - No internet-hosted test files or real downloads have been used during validation.
 
