@@ -6,6 +6,8 @@ import "./App.css";
 type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "cancelled";
 type DownloadFilter = "all" | "active" | "completed";
 type DownloadAction = "pause" | "resume" | "cancel" | "retry";
+type DownloadSort = "recent" | "name" | "size" | "progress";
+type DownloadGrouping = "none" | "status";
 
 type Download = {
   id: string;
@@ -19,12 +21,16 @@ type Download = {
 
 type DownloadUpdate = Omit<Download, "url">;
 type StartedDownload = Pick<Download, "id" | "filename">;
+type TransferSample = { bytes: number; at: number };
+type DownloadGroup = { id: string; label: string; downloads: Download[] };
 
 const filters: { id: DownloadFilter; label: string }[] = [
   { id: "all", label: "All downloads" },
   { id: "active", label: "Active" },
   { id: "completed", label: "Completed" },
 ];
+
+const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "failed", "completed", "cancelled"];
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -36,6 +42,40 @@ function formatBytes(bytes: number): string {
     unitIndex += 1;
   }
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatEta(seconds: number): string {
+  const remaining = Math.max(0, Math.ceil(seconds));
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const secs = remaining % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function transferRate(samples: TransferSample[], now: number): number | null {
+  if (samples.length < 3) return null;
+  const recent = samples.filter((sample) => now - sample.at <= 8_000);
+  const first = recent[0];
+  const last = recent[recent.length - 1];
+  if (recent.length < 3 || !first || !last || now - last.at > 4_000 || last.at - first.at < 2_000 || last.bytes <= first.bytes) {
+    return null;
+  }
+  return ((last.bytes - first.bytes) * 1000) / (last.at - first.at);
+}
+
+function sourceFor(download: Download): string | null {
+  if (!download.url) return null;
+  try {
+    return new URL(download.url).hostname;
+  } catch {
+    return null;
+  }
 }
 
 function progressFor(download: Download): number | null {
@@ -55,10 +95,24 @@ function isActive(status: DownloadStatus): boolean {
   return status === "queued" || status === "downloading" || status === "paused";
 }
 
+function statusLabel(status: DownloadStatus): string {
+  if (status === "completed") return "Complete";
+  if (status === "failed") return "Failed";
+  if (status === "cancelled") return "Cancelled";
+  if (status === "paused") return "Paused";
+  if (status === "queued") return "Queued";
+  return "Downloading";
+}
+
 function App() {
   const [url, setUrl] = useState("");
   const [downloads, setDownloads] = useState<Download[]>([]);
   const [filter, setFilter] = useState<DownloadFilter>("all");
+  const [sortBy, setSortBy] = useState<DownloadSort>("recent");
+  const [groupBy, setGroupBy] = useState<DownloadGrouping>("none");
+  const [search, setSearch] = useState("");
+  const [transferSamples, setTransferSamples] = useState<Record<string, TransferSample[]>>({});
+  const [clock, setClock] = useState(() => performance.now());
   const [errorMessage, setErrorMessage] = useState("");
   const [isStarting, setIsStarting] = useState(false);
   const [busyActionId, setBusyActionId] = useState<string | null>(null);
@@ -71,11 +125,42 @@ function App() {
       try {
         const stopListening = await listen<DownloadUpdate>("download-update", ({ payload }) => {
           setDownloads((current) => upsertDownload(current, payload));
+          const sample = { bytes: payload.downloadedBytes, at: performance.now() };
+          setTransferSamples((current) => {
+            const previous = current[payload.id] ?? [];
+            if (payload.status !== "downloading") {
+              if (!previous.length) return current;
+              const next = { ...current };
+              delete next[payload.id];
+              return next;
+            }
+            const last = previous[previous.length - 1];
+            if (last && sample.bytes < last.bytes) {
+              return { ...current, [payload.id]: [sample] };
+            }
+            if (last && sample.bytes === last.bytes) return current;
+            const nextSamples =
+              last && sample.at - last.at < 750
+                ? [...previous.slice(0, -1), sample]
+                : [...previous, sample];
+            return { ...current, [payload.id]: nextSamples.slice(-12) };
+          });
         });
-        if (disposed) stopListening();
-        else unlisten = stopListening;
+        if (disposed) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+
+        const restored = await invoke<Download[]>("list_downloads");
+        if (!disposed) {
+          setDownloads((current) => {
+            const currentIds = new Set(current.map((download) => download.id));
+            return [...current, ...restored.filter((download) => !currentIds.has(download.id))];
+          });
+        }
       } catch (error) {
-        setErrorMessage(`Could not receive download updates: ${String(error)}`);
+        setErrorMessage(`Could not initialize downloads: ${String(error)}`);
       }
     };
 
@@ -91,15 +176,49 @@ function App() {
     () => downloads.filter((download) => download.status === "completed").length,
     [downloads],
   );
-  const visibleDownloads = useMemo(
-    () =>
-      downloads.filter((download) => {
-        if (filter === "active") return isActive(download.status);
-        if (filter === "completed") return download.status === "completed";
-        return true;
-      }),
-    [downloads, filter],
-  );
+  const hasDownloading = downloads.some((download) => download.status === "downloading");
+
+  useEffect(() => {
+    if (!hasDownloading) return;
+    const timer = window.setInterval(() => setClock(performance.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasDownloading]);
+
+  const visibleDownloads = useMemo(() => {
+    const normalizedSearch = search.trim().toLocaleLowerCase();
+    const filtered = downloads.filter((download) => {
+      if (filter === "active" && !isActive(download.status)) return false;
+      if (filter === "completed" && download.status !== "completed") return false;
+      if (!normalizedSearch) return true;
+      return [download.filename, download.url ?? "", download.error ?? "", statusLabel(download.status)]
+        .some((value) => value.toLocaleLowerCase().includes(normalizedSearch));
+    });
+    if (sortBy === "name") {
+      return [...filtered].sort((a, b) => a.filename.localeCompare(b.filename));
+    }
+    if (sortBy === "size") {
+      return [...filtered].sort((a, b) => {
+        if (a.totalBytes === null) return b.totalBytes === null ? 0 : 1;
+        if (b.totalBytes === null) return -1;
+        return b.totalBytes - a.totalBytes;
+      });
+    }
+    if (sortBy === "progress") {
+      return [...filtered].sort((a, b) => (progressFor(b) ?? -1) - (progressFor(a) ?? -1));
+    }
+    return filtered;
+  }, [downloads, filter, search, sortBy]);
+
+  const downloadGroups = useMemo<DownloadGroup[]>(() => {
+    if (groupBy === "none") return [{ id: "all", label: "", downloads: visibleDownloads }];
+    return statusOrder
+      .map((status) => ({
+        id: status,
+        label: statusLabel(status),
+        downloads: visibleDownloads.filter((download) => download.status === status),
+      }))
+      .filter((group) => group.downloads.length > 0);
+  }, [groupBy, visibleDownloads]);
 
   async function enqueueDownload(submittedUrl: string, clearInput = false) {
     setErrorMessage("");
@@ -197,7 +316,7 @@ function App() {
           <span className="engine-indicator" />
           <div>
             <div className="engine-title">Download engine</div>
-            <div className="engine-caption">Ready for your links</div>
+            <div className="engine-caption">Up to 3 downloads at once</div>
           </div>
           <span className="engine-state">READY</span>
         </div>
@@ -255,6 +374,8 @@ function App() {
               Files are saved to your Downloads folder
               <span className="hint-separator">·</span>
               HTTP and HTTPS links supported
+              <span className="hint-separator">·</span>
+              Up to 3 run at once
             </div>
           </form>
 
@@ -276,6 +397,35 @@ function App() {
             </div>
           </div>
 
+          <div className="list-controls">
+            <label className="download-search">
+              <span className="control-icon" aria-hidden="true">⌕</span>
+              <input
+                aria-label="Search downloads"
+                onChange={(event) => setSearch(event.currentTarget.value)}
+                placeholder="Search downloads"
+                type="search"
+                value={search}
+              />
+            </label>
+            <label className="select-control">
+              <span>Sort</span>
+              <select aria-label="Sort downloads" onChange={(event) => setSortBy(event.currentTarget.value as DownloadSort)} value={sortBy}>
+                <option value="recent">Recently added</option>
+                <option value="name">Name</option>
+                <option value="size">File size</option>
+                <option value="progress">Progress</option>
+              </select>
+            </label>
+            <label className="select-control">
+              <span>Group</span>
+              <select aria-label="Group downloads" onChange={(event) => setGroupBy(event.currentTarget.value as DownloadGrouping)} value={groupBy}>
+                <option value="none">No grouping</option>
+                <option value="status">By status</option>
+              </select>
+            </label>
+          </div>
+
           {visibleDownloads.length === 0 ? (
             <div className="empty-state">
               <div className="empty-art" aria-hidden="true">
@@ -288,14 +438,29 @@ function App() {
                 <div className="empty-arrow">↓</div>
                 <div className="empty-ground" />
               </div>
-              <h3>{filter === "all" ? "Your download list is empty" : `No ${filter} downloads`}</h3>
-              <p>Paste a direct file link above and it will appear here.</p>
+              <h3>{search.trim() ? "No matching downloads" : downloads.length === 0 ? "Your download list is empty" : `No ${filter} downloads`}</h3>
+              <p>{search.trim() ? "Try a different name, address or status." : "Paste a direct file link above and it will appear here."}</p>
             </div>
           ) : (
             <div className="download-list">
-              {visibleDownloads.map((download) => {
+              {downloadGroups.map((group) => (
+                <section aria-label={group.label || "Downloads"} className="download-group" key={group.id}>
+                  {group.label && (
+                    <h3 className="group-heading">
+                      <span>{group.label}</span>
+                      <span>{group.downloads.length}</span>
+                    </h3>
+                  )}
+                  {group.downloads.map((download) => {
                 const progress = progressFor(download);
                 const isBusy = busyActionId !== null;
+                const speed = download.status === "downloading"
+                  ? transferRate(transferSamples[download.id] ?? [], clock)
+                  : null;
+                const source = sourceFor(download);
+                const eta = speed !== null && download.totalBytes !== null
+                  ? (download.totalBytes - download.downloadedBytes) / speed
+                  : null;
                 const progressWidth =
                   progress !== null
                     ? `${progress}%`
@@ -319,20 +484,13 @@ function App() {
                     </div>
                     <div className="download-details">
                       <div className="download-title-line">
-                        <h3 title={download.filename}>{download.filename}</h3>
+                        <div className="download-name">
+                          <h3 title={download.filename}>{download.filename}</h3>
+                          {source && <span className="download-source" title={download.url}>{source}</span>}
+                        </div>
                         <span className={`status-pill ${download.status}`}>
                           <span className="status-dot" />
-                          {download.status === "completed"
-                            ? "Complete"
-                            : download.status === "failed"
-                              ? "Failed"
-                              : download.status === "cancelled"
-                                ? "Cancelled"
-                                : download.status === "paused"
-                                  ? "Paused"
-                                  : download.status === "queued"
-                                    ? "Queued"
-                                    : "Downloading"}
+                          {statusLabel(download.status)}
                         </span>
                       </div>
                       <div className="progress-track" aria-label={progress === null ? "Download progress unknown" : `${progress}% complete`}>
@@ -345,13 +503,23 @@ function App() {
                         {download.error ? (
                           <span className="download-error">{download.error}</span>
                         ) : (
-                          <span>{formatBytes(download.downloadedBytes)}{download.totalBytes ? ` of ${formatBytes(download.totalBytes)}` : " downloaded"}</span>
+                          <span>
+                            {download.totalBytes !== null
+                              ? `${formatBytes(download.downloadedBytes)} of ${formatBytes(download.totalBytes)}`
+                              : `${formatBytes(download.downloadedBytes)} downloaded · size unknown`}
+                          </span>
                         )}
                         {progress !== null && <span className="progress-percent">{progress}%</span>}
                       </div>
+                      {download.status === "downloading" && (
+                        <div className="transfer-meta" aria-live="polite">
+                          <span>{speed === null ? "Measuring speed…" : formatSpeed(speed)}</span>
+                          {eta !== null && eta >= 0 && <span>About {formatEta(eta)} left</span>}
+                        </div>
+                      )}
                     </div>
                     <div className="row-actions">
-                      {download.status === "downloading" && (
+                      {(download.status === "downloading" || download.status === "queued") && (
                         <button
                           className="row-action-button"
                           disabled={isBusy}
@@ -395,7 +563,9 @@ function App() {
                     </div>
                   </article>
                 );
-              })}
+                  })}
+                </section>
+              ))}
             </div>
           )}
 

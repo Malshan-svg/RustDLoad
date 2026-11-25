@@ -1,22 +1,39 @@
 use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::{io::AsyncWriteExt, sync::watch};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+};
 use uuid::Uuid;
+
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadUpdate {
     id: String,
     filename: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSnapshot {
+    id: String,
+    filename: String,
+    url: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     status: String,
@@ -38,16 +55,33 @@ enum Control {
 }
 
 struct DownloadEntry {
+    url: String,
     filename: String,
     status: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
+    error: Option<String>,
     control: watch::Sender<Control>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DownloadManager {
     entries: Arc<Mutex<HashMap<String, DownloadEntry>>>,
+    persistence_file: Option<PathBuf>,
+    persistence_lock: Arc<Mutex<()>>,
+    slots: Arc<Semaphore>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDownload {
+    id: String,
+    url: String,
+    filename: String,
+    status: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    error: Option<String>,
 }
 
 fn emit_update(app: &AppHandle, update: DownloadUpdate) {
@@ -63,6 +97,7 @@ fn update_entry(
     status: &str,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
+    error: Option<String>,
 ) -> Result<String, String> {
     let mut entries = manager
         .entries
@@ -81,7 +116,241 @@ fn update_entry(
     entry.status = status.to_string();
     entry.downloaded_bytes = downloaded_bytes;
     entry.total_bytes = total_bytes;
+    entry.error = error;
     Ok(status.to_string())
+}
+
+impl DownloadManager {
+    fn persist(&self) -> Result<(), String> {
+        let Some(path) = self.persistence_file.as_deref() else {
+            return Ok(());
+        };
+        let _persistence_guard = self
+            .persistence_lock
+            .lock()
+            .map_err(|_| "Download persistence is unavailable.".to_string())?;
+        let mut snapshot: Vec<_> = {
+            let entries = self
+                .entries
+                .lock()
+                .map_err(|_| "Download state is unavailable.".to_string())?;
+            entries
+                .iter()
+                .map(|(id, entry)| PersistedDownload {
+                    id: id.clone(),
+                    url: entry.url.clone(),
+                    filename: entry.filename.clone(),
+                    status: entry.status.clone(),
+                    downloaded_bytes: entry.downloaded_bytes,
+                    total_bytes: entry.total_bytes,
+                    error: entry.error.clone(),
+                })
+                .collect()
+        };
+        snapshot.sort_by(|left, right| left.id.cmp(&right.id));
+        persist_snapshot(path, &snapshot)
+    }
+}
+
+fn persist_snapshot(path: &Path, snapshot: &[PersistedDownload]) -> Result<(), String> {
+    let serialized = serde_json::to_vec_pretty(snapshot)
+        .map_err(|error| format!("Could not serialize the download queue: {error}"))?;
+    let temporary_path = path.with_extension("json.tmp");
+    let backup_path = path.with_extension("json.bak");
+    std::fs::write(&temporary_path, serialized)
+        .map_err(|error| format!("Could not write the download queue: {error}"))?;
+
+    if path.exists() {
+        if backup_path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("Could not replace the download queue: {error}"))?;
+        } else {
+            std::fs::rename(path, &backup_path).map_err(|error| {
+                format!("Could not preserve the previous download queue: {error}")
+            })?;
+        }
+    }
+    if let Err(error) = std::fs::rename(&temporary_path, path) {
+        if backup_path.exists() && !path.exists() {
+            let _ = std::fs::rename(&backup_path, path);
+        }
+        return Err(format!("Could not save the download queue: {error}"));
+    }
+    if backup_path.exists() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
+fn restore_download_manager(
+    persistence_file: PathBuf,
+    download_dir: &Path,
+) -> Result<(DownloadManager, Vec<PersistedDownload>), String> {
+    std::fs::create_dir_all(download_dir)
+        .map_err(|error| format!("Could not create the Downloads folder: {error}"))?;
+
+    let backup_file = persistence_file.with_extension("json.bak");
+    let records = read_persisted_queue(&persistence_file, &backup_file)?;
+    let manager = DownloadManager {
+        entries: Arc::default(),
+        persistence_file: Some(persistence_file),
+        persistence_lock: Arc::default(),
+        slots: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
+    };
+    let mut resumable = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for mut record in records {
+        if Uuid::parse_str(&record.id).is_err()
+            || !seen_ids.insert(record.id.clone())
+            || record.filename.is_empty()
+            || record
+                .filename
+                .chars()
+                .any(|character| matches!(character, '/' | '\\'))
+            || !matches!(
+                Path::new(&record.filename)
+                    .components()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [Component::Normal(_)]
+            )
+        {
+            eprintln!("Ignoring an invalid persisted download record.");
+            continue;
+        }
+        let valid_url = reqwest::Url::parse(&record.url)
+            .map(|url| matches!(url.scheme(), "http" | "https"))
+            .unwrap_or(false);
+        if !valid_url {
+            record.status = "failed".to_string();
+            record.error = Some("The saved download URL is invalid.".to_string());
+        }
+
+        let partial_path = download_dir.join(format!(".{}.part", record.id));
+        let partial_size = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
+        {
+            match std::fs::metadata(&partial_path) {
+                Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+                Ok(_) => {
+                    record.status = "failed".to_string();
+                    record.error = Some("The partial download path is not a file.".to_string());
+                    None
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    std::fs::File::create(&partial_path).map_err(|error| {
+                        format!("Could not restore partial download {}: {error}", record.id)
+                    })?;
+                    Some(0)
+                }
+                Err(error) => {
+                    record.status = "failed".to_string();
+                    record.error = Some(format!("Could not inspect the partial download: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let completed_size = if record.status == "completed" {
+            std::fs::metadata(download_dir.join(&record.filename))
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+        } else {
+            None
+        };
+        if reconcile_persisted_status(&mut record, partial_size, completed_size) {
+            resumable.push(record.clone());
+        }
+
+        let (sender, receiver) = watch::channel(if record.status == "paused" {
+            Control::Paused
+        } else {
+            Control::Running
+        });
+        manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable while restoring the queue.".to_string())?
+            .insert(
+                record.id.clone(),
+                DownloadEntry {
+                    url: record.url.clone(),
+                    filename: record.filename.clone(),
+                    status: record.status.clone(),
+                    downloaded_bytes: record.downloaded_bytes,
+                    total_bytes: record.total_bytes,
+                    error: record.error.clone(),
+                    control: sender,
+                },
+            );
+        drop(receiver);
+    }
+
+    manager.persist()?;
+    Ok((manager, resumable))
+}
+
+fn read_persisted_queue(
+    persistence_file: &Path,
+    backup_file: &Path,
+) -> Result<Vec<PersistedDownload>, String> {
+    let read = |path: &Path| -> Result<Vec<PersistedDownload>, String> {
+        let contents = std::fs::read(path)
+            .map_err(|error| format!("Could not read the download queue: {error}"))?;
+        serde_json::from_slice(&contents)
+            .map_err(|error| format!("Could not parse the download queue: {error}"))
+    };
+    if persistence_file.exists() {
+        match read(persistence_file) {
+            Ok(records) => return Ok(records),
+            Err(error) if backup_file.exists() => {
+                eprintln!("{error}; trying the previous queue snapshot.");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if backup_file.exists() {
+        return read(backup_file);
+    }
+    Ok(Vec::new())
+}
+
+fn reconcile_persisted_status(
+    record: &mut PersistedDownload,
+    partial_size: Option<u64>,
+    completed_size: Option<u64>,
+) -> bool {
+    match record.status.as_str() {
+        "queued" | "downloading" | "paused" => {
+            record.status = "paused".to_string();
+            record.downloaded_bytes = partial_size.unwrap_or(0);
+            record.error = None;
+            true
+        }
+        "completed"
+            if completed_size == Some(record.downloaded_bytes)
+                && record
+                    .total_bytes
+                    .is_none_or(|total| total == record.downloaded_bytes) =>
+        {
+            false
+        }
+        "completed" => {
+            record.status = "failed".to_string();
+            record.error = Some(
+                "The saved completed file is missing or its size no longer matches.".to_string(),
+            );
+            false
+        }
+        "failed" | "cancelled" => false,
+        _ => {
+            record.status = "failed".to_string();
+            record.error = Some("The saved download status is invalid.".to_string());
+            false
+        }
+    }
 }
 
 fn publish_update(
@@ -94,13 +363,24 @@ fn publish_update(
     total_bytes: Option<u64>,
     error: Option<String>,
 ) {
-    let status = match update_entry(manager, id, filename, status, downloaded_bytes, total_bytes) {
+    let status = match update_entry(
+        manager,
+        id,
+        filename,
+        status,
+        downloaded_bytes,
+        total_bytes,
+        error.clone(),
+    ) {
         Ok(status) => status,
         Err(state_error) => {
             eprintln!("{state_error}");
             status.to_string()
         }
     };
+    if let Err(persist_error) = manager.persist() {
+        eprintln!("{persist_error}");
+    }
     emit_update(
         app,
         DownloadUpdate {
@@ -289,20 +569,40 @@ async fn finish_failed(
     );
 }
 
-enum WaitResult {
-    Running,
+enum SlotResult {
+    Acquired(OwnedSemaphorePermit),
     Cancelled,
 }
 
-async fn wait_until_running(receiver: &mut watch::Receiver<Control>) -> WaitResult {
+async fn acquire_download_slot(
+    semaphore: &Arc<Semaphore>,
+    receiver: &mut watch::Receiver<Control>,
+) -> Result<SlotResult, String> {
     loop {
         let control = *receiver.borrow();
         match control {
-            Control::Running => return WaitResult::Running,
-            Control::Cancelled => return WaitResult::Cancelled,
+            Control::Running => {}
+            Control::Cancelled => return Ok(SlotResult::Cancelled),
             Control::Paused => {
                 if receiver.changed().await.is_err() {
-                    return WaitResult::Cancelled;
+                    return Ok(SlotResult::Cancelled);
+                }
+                continue;
+            }
+        }
+
+        tokio::select! {
+            permit = semaphore.clone().acquire_owned() => {
+                let permit = permit.map_err(|error| format!("Could not acquire a download slot: {error}"))?;
+                let control = *receiver.borrow();
+                if control == Control::Running {
+                    return Ok(SlotResult::Acquired(permit));
+                }
+                drop(permit);
+            }
+            changed = receiver.changed() => {
+                if changed.is_err() {
+                    return Ok(SlotResult::Cancelled);
                 }
             }
         }
@@ -366,8 +666,9 @@ async fn download_file(
             }
         };
 
-        match wait_until_running(&mut control).await {
-            WaitResult::Cancelled => {
+        let _slot = match acquire_download_slot(&manager.slots, &mut control).await {
+            Ok(SlotResult::Acquired(slot)) => slot,
+            Ok(SlotResult::Cancelled) => {
                 if let Err(error) = remove_partial_file(&path).await {
                     publish_update(
                         &app,
@@ -393,8 +694,31 @@ async fn download_file(
                 }
                 return;
             }
-            WaitResult::Running => {}
-        }
+            Err(error) => {
+                finish_failed(
+                    &app,
+                    &manager,
+                    &id,
+                    &filename,
+                    &path,
+                    offset,
+                    total_bytes,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+        publish_update(
+            &app,
+            &manager,
+            &id,
+            &filename,
+            "downloading",
+            offset,
+            total_bytes,
+            None,
+        );
 
         let can_resume = offset > 0;
         let mut request = client.get(&url);
@@ -846,6 +1170,7 @@ fn control_download(
         }
         entry.control.send_replace(action);
         entry.status = status.to_string();
+        entry.error = None;
         DownloadUpdate {
             id: id.to_string(),
             filename: entry.filename.clone(),
@@ -856,6 +1181,9 @@ fn control_download(
         }
     };
     emit_update(app, update);
+    if let Err(error) = manager.persist() {
+        eprintln!("{error}");
+    }
     Ok(())
 }
 
@@ -865,7 +1193,7 @@ fn validate_transition(current: &str, target: &str) -> Result<(), String> {
             "Cannot {target} a download that is already {current}."
         ));
     }
-    if target == "downloading" && current != "paused" {
+    if matches!(target, "downloading" | "queued") && current != "paused" {
         return Err("Only a paused download can be resumed.".to_string());
     }
     Ok(())
@@ -924,10 +1252,12 @@ async fn start_download(
         .insert(
             id.clone(),
             DownloadEntry {
+                url: parsed_url.to_string(),
                 filename: filename.clone(),
                 status: "queued".to_string(),
                 downloaded_bytes: 0,
                 total_bytes: None,
+                error: None,
                 control: sender,
             },
         );
@@ -956,6 +1286,28 @@ async fn start_download(
 }
 
 #[tauri::command]
+fn list_downloads(manager: State<'_, DownloadManager>) -> Result<Vec<DownloadSnapshot>, String> {
+    let entries = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?;
+    let mut downloads: Vec<_> = entries
+        .iter()
+        .map(|(id, entry)| DownloadSnapshot {
+            id: id.clone(),
+            filename: entry.filename.clone(),
+            url: entry.url.clone(),
+            downloaded_bytes: entry.downloaded_bytes,
+            total_bytes: entry.total_bytes,
+            status: entry.status.clone(),
+            error: entry.error.clone(),
+        })
+        .collect();
+    downloads.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(downloads)
+}
+
+#[tauri::command]
 fn pause_download(
     app: AppHandle,
     manager: State<'_, DownloadManager>,
@@ -970,7 +1322,7 @@ fn resume_download(
     manager: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
-    control_download(&app, &manager, &id, Control::Running, "downloading")
+    control_download(&app, &manager, &id, Control::Running, "queued")
 }
 
 #[tauri::command]
@@ -985,8 +1337,9 @@ fn cancel_download(
 #[cfg(test)]
 mod tests {
     use super::{
-        filename_from_url, is_reserved_windows_name, numbered_filename, parse_content_range,
-        validate_transition,
+        Control, PersistedDownload, SlotResult, acquire_download_slot, filename_from_url,
+        is_reserved_windows_name, numbered_filename, parse_content_range, persist_snapshot,
+        read_persisted_queue, reconcile_persisted_status, validate_transition,
     };
 
     #[test]
@@ -1019,21 +1372,153 @@ mod tests {
     fn download_state_transitions_reject_resume_and_control_after_terminal_states() {
         assert!(validate_transition("queued", "paused").is_ok());
         assert!(validate_transition("paused", "downloading").is_ok());
+        assert!(validate_transition("paused", "queued").is_ok());
         assert!(validate_transition("downloading", "downloading").is_err());
+        assert!(validate_transition("queued", "queued").is_err());
         assert!(validate_transition("completed", "paused").is_err());
         assert!(validate_transition("cancelled", "downloading").is_err());
+    }
+
+    fn persisted_download(status: &str, downloaded_bytes: u64) -> PersistedDownload {
+        PersistedDownload {
+            id: "c04e4566-0d5e-47c6-8863-9f2d6d327849".to_string(),
+            url: "https://example.com/archive.zip".to_string(),
+            filename: "archive.zip".to_string(),
+            status: status.to_string(),
+            downloaded_bytes,
+            total_bytes: Some(12),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn interrupted_download_recovers_paused_at_actual_partial_size() {
+        let mut record = persisted_download("downloading", 9);
+        assert!(reconcile_persisted_status(&mut record, Some(7), None));
+        assert_eq!(record.status, "paused");
+        assert_eq!(record.downloaded_bytes, 7);
+        assert_eq!(record.total_bytes, Some(12));
+    }
+
+    #[test]
+    fn interrupted_download_with_missing_partial_restarts_at_zero() {
+        let mut record = persisted_download("paused", 9);
+        assert!(reconcile_persisted_status(&mut record, Some(0), None));
+        assert_eq!(record.status, "paused");
+        assert_eq!(record.downloaded_bytes, 0);
+    }
+
+    #[test]
+    fn completed_download_is_restored_only_when_file_size_matches() {
+        let mut complete = persisted_download("completed", 12);
+        assert!(!reconcile_persisted_status(&mut complete, None, Some(12)));
+        assert_eq!(complete.status, "completed");
+        assert!(complete.error.is_none());
+
+        let mut incomplete = persisted_download("completed", 12);
+        assert!(!reconcile_persisted_status(&mut incomplete, None, Some(11)));
+        assert_eq!(incomplete.status, "failed");
+        assert!(incomplete.error.is_some());
+
+        let mut missing = persisted_download("completed", 12);
+        assert!(!reconcile_persisted_status(&mut missing, None, None));
+        assert_eq!(missing.status, "failed");
+    }
+
+    #[test]
+    fn persisted_queue_round_trips_and_uses_backup_when_primary_is_invalid() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let queue_file = directory.join("downloads.json");
+        let backup_file = directory.join("downloads.json.bak");
+        let record = persisted_download("paused", 7);
+
+        persist_snapshot(&queue_file, std::slice::from_ref(&record)).unwrap();
+        let restored = read_persisted_queue(&queue_file, &backup_file).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, record.id);
+
+        std::fs::write(&queue_file, b"{").unwrap();
+        std::fs::write(&backup_file, serde_json::to_vec(&[record]).unwrap()).unwrap();
+        let recovered = read_persisted_queue(&queue_file, &backup_file).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, "paused");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_queued_download_waits_without_taking_a_slot() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (sender, mut receiver) = tokio::sync::watch::channel(Control::Paused);
+        let task_semaphore = semaphore.clone();
+        let waiter =
+            tokio::spawn(
+                async move { acquire_download_slot(&task_semaphore, &mut receiver).await },
+            );
+
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.available_permits(), 1);
+        sender.send_replace(Control::Running);
+        let result = waiter.await.unwrap().unwrap();
+        assert!(matches!(result, SlotResult::Acquired(_)));
+        assert_eq!(semaphore.available_permits(), 0);
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(DownloadManager::default())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&app_data_dir)?;
+            let download_dir = app.path().download_dir()?;
+            let persistence_file = app_data_dir.join("downloads.json");
+            let (manager, recovered) = restore_download_manager(persistence_file, &download_dir)
+                .map_err(|error| std::io::Error::other(error))?;
+            app.manage(manager.clone());
+
+            for record in recovered {
+                let receiver = manager
+                    .entries
+                    .lock()
+                    .map_err(|_| {
+                        std::io::Error::other("Download state is unavailable during recovery.")
+                    })?
+                    .get(&record.id)
+                    .map(|entry| entry.control.subscribe())
+                    .ok_or_else(|| {
+                        std::io::Error::other("Recovered download disappeared from the queue.")
+                    })?;
+                let task_manager = manager.clone();
+                let task_app = app.handle().clone();
+                let partial_path = download_dir.join(format!(".{}.part", record.id));
+                let task_directory = download_dir.clone();
+                let task_id = record.id.clone();
+                let task_url = record.url.clone();
+                let task_filename = record.filename.clone();
+                tauri::async_runtime::spawn(async move {
+                    download_file(
+                        task_app,
+                        task_manager,
+                        task_id,
+                        task_url,
+                        task_filename,
+                        task_directory,
+                        partial_path,
+                        receiver,
+                    )
+                    .await;
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_download,
             pause_download,
             resume_download,
-            cancel_download
+            cancel_download,
+            list_downloads
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

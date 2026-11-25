@@ -497,6 +497,70 @@ h1 {
   letter-spacing: 0.9px;
 }
 
+.list-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.download-search,
+.select-control {
+  display: flex;
+  height: 34px;
+  align-items: center;
+  border: 1px solid #303730;
+  border-radius: 6px;
+  background: #171b17;
+  color: #858d82;
+}
+
+.download-search {
+  min-width: 180px;
+  flex: 1;
+  padding: 0 9px;
+}
+
+.control-icon {
+  margin-right: 7px;
+  color: #9baa91;
+  font-size: 17px;
+}
+
+.download-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #dce1d9;
+  font-size: 10px;
+}
+
+.download-search input::placeholder {
+  color: #6f786b;
+}
+
+.select-control {
+  gap: 6px;
+  padding: 0 8px;
+  font-size: 9px;
+}
+
+.select-control select {
+  max-width: 130px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #d5dad1;
+  font-size: 10px;
+}
+
+.select-control option {
+  background: #202520;
+  color: #d5dad1;
+}
+
 .live-dot {
   width: 5px;
   height: 5px;
@@ -612,6 +676,28 @@ h1 {
   border-top: 1px solid #292f29;
 }
 
+.download-group + .download-group {
+  border-top: 1px solid #292f29;
+}
+
+.group-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 16px;
+  background: rgba(31, 37, 31, 0.72);
+  color: #a7b09f;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+
+.group-heading span:last-child {
+  color: #747d70;
+  font-variant-numeric: tabular-nums;
+}
+
 .file-icon {
   display: grid;
   width: 38px;
@@ -655,6 +741,21 @@ h1 {
   color: #dce1d9;
   font-size: 11px;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-name {
+  min-width: 0;
+  flex: 1;
+}
+
+.download-source {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: #727b6f;
+  font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -755,6 +856,16 @@ h1 {
 
 .progress-percent {
   color: #a7c393;
+  font-variant-numeric: tabular-nums;
+}
+
+.transfer-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  color: #8fac79;
+  font-size: 9px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -871,6 +982,14 @@ h1 {
 
   .form-hint {
     flex-wrap: wrap;
+  }
+
+  .list-controls {
+    flex-wrap: wrap;
+  }
+
+  .download-search {
+    flex-basis: 100%;
   }
 
   .start-button {

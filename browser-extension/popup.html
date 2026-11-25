@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RustDLoad link handoff</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <span class="mark" aria-hidden="true">↓</span>
+        <div>
+          <h1>RustDLoad</h1>
+          <p>Browser link handoff · prototype</p>
+        </div>
+      </header>
+
+      <p class="notice">
+        Nothing is intercepted or sent automatically. Paste a direct file link,
+        then prepare a request for the future desktop bridge.
+      </p>
+
+      <form id="request-form">
+        <label for="url">HTTP(S) download link</label>
+        <input id="url" name="url" type="url" inputmode="url"
+          placeholder="https://example.com/file.zip" autocomplete="url" required>
+        <button type="submit">Prepare request</button>
+      </form>
+
+      <p id="status" role="status" aria-live="polite">
+        Desktop transport is not installed; this prepares a local message only.
+      </p>
+
+      <label for="request">Request contract</label>
+      <textarea id="request" rows="9" readonly spellcheck="false"
+        placeholder="The prepared JSON request will appear here."></textarea>
+      <button id="select-request" class="secondary" type="button" disabled>
+        Select JSON to copy
+      </button>
+      <p class="footnote">No browser download permissions or website access are used.</p>
+    </main>
+  </body>
+</html>
