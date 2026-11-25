@@ -327,6 +327,21 @@ kbd {
   color: var(--muted);
 }
 
+.schedule-field {
+  display: flex;
+  flex: 0 0 176px;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.schedule-field input {
+  height: 34px;
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+
 .start-button {
   display: flex;
   height: 34px;

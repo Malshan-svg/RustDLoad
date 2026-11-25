@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
-type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "link-expired" | "cancelled";
+type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "link-expired" | "cancelled" | "scheduled";
 type DownloadFilter = "all" | "downloading" | "queued" | "completed";
 type DownloadAction = "pause" | "resume" | "cancel" | "retry";
 type DownloadSort = "recent" | "name" | "size" | "progress";
@@ -34,12 +34,18 @@ type Download = {
   totalBytes: number | null;
   status: DownloadStatus;
   error: string | null;
+  scheduledStartMs: number | null;
 };
 
 type DownloadUpdate = Omit<Download, "url">;
 type StartedDownload = Pick<Download, "id" | "filename"> & { duplicate: boolean; skipped: boolean };
 type FileExistsPolicy = "rename" | "overwrite" | "skip";
-type DownloadSettings = { maxConcurrentDownloads: number; fileExistsPolicy: FileExistsPolicy };
+type DownloadSettings = {
+  maxConcurrentDownloads: number;
+  fileExistsPolicy: FileExistsPolicy;
+  globalBandwidthLimitBps: number | null;
+  perDownloadBandwidthLimitBps: number | null;
+};
 type OpenFileOutcome = { confirmationRequired: boolean };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
@@ -51,7 +57,7 @@ const filters: { id: DownloadFilter; label: string; icon: IconName }[] = [
   { id: "completed", label: "Completed", icon: "check" },
 ];
 
-const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "link-expired", "failed", "completed", "cancelled"];
+const statusOrder: DownloadStatus[] = ["downloading", "queued", "scheduled", "paused", "link-expired", "failed", "completed", "cancelled"];
 
 function normalizedUrlForDuplicateCheck(value: string): string {
   try {
@@ -147,7 +153,9 @@ function upsertDownload(downloads: Download[], update: DownloadUpdate): Download
   const index = downloads.findIndex((download) => download.id === update.id);
   if (index === -1) return [update, ...downloads];
   return downloads.map((download) =>
-    download.id === update.id ? { ...update, url: download.url } : download,
+    download.id === update.id
+      ? { ...update, url: download.url, scheduledStartMs: download.scheduledStartMs }
+      : download,
   );
 }
 
@@ -162,6 +170,7 @@ function statusLabel(status: DownloadStatus): string {
   if (status === "cancelled") return "Cancelled";
   if (status === "paused") return "Paused";
   if (status === "queued") return "Queued";
+  if (status === "scheduled") return "Scheduled";
   return "Downloading";
 }
 
@@ -183,6 +192,9 @@ function App() {
   const [fileExistsPolicy, setFileExistsPolicy] = useState<FileExistsPolicy>("rename");
   const [settingsError, setSettingsError] = useState("");
   const [filePolicyError, setFilePolicyError] = useState("");
+  const [scheduleDraft, setScheduleDraft] = useState("");
+  const [globalBandwidthDraft, setGlobalBandwidthDraft] = useState("");
+  const [perDownloadBandwidthDraft, setPerDownloadBandwidthDraft] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isSavingFilePolicy, setIsSavingFilePolicy] = useState(false);
   const [isExportingDiagnostics, setIsExportingDiagnostics] = useState(false);
@@ -237,6 +249,16 @@ function App() {
           setMaxConcurrentDownloads(settings.maxConcurrentDownloads);
           setConcurrencyDraft(String(settings.maxConcurrentDownloads));
           setFileExistsPolicy(settings.fileExistsPolicy);
+          setGlobalBandwidthDraft(
+            settings.globalBandwidthLimitBps === null
+              ? ""
+              : String(Math.round(settings.globalBandwidthLimitBps / 1024)),
+          );
+          setPerDownloadBandwidthDraft(
+            settings.perDownloadBandwidthLimitBps === null
+              ? ""
+              : String(Math.round(settings.perDownloadBandwidthLimitBps / 1024)),
+          );
         }
       } catch (error) {
         setErrorMessage(`Could not initialize downloads: ${String(error)}`);
@@ -255,7 +277,7 @@ function App() {
     [downloads],
   );
   const queuedCount = useMemo(
-    () => downloads.filter((download) => download.status === "queued" || download.status === "paused").length,
+    () => downloads.filter((download) => download.status === "queued" || download.status === "paused" || download.status === "scheduled").length,
     [downloads],
   );
   const completedCount = useMemo(
@@ -337,6 +359,13 @@ function App() {
     setNoticeMessage("");
     if (clearInput) setIsStarting(true);
     try {
+      const scheduledStartMs = scheduleDraft
+        ? new Date(scheduleDraft).getTime()
+        : null;
+      if (scheduledStartMs !== null && (!Number.isFinite(scheduledStartMs) || scheduledStartMs <= Date.now())) {
+        setErrorMessage("Choose a schedule time in the future.");
+        return;
+      }
       const normalizedUrl = normalizedUrlForDuplicateCheck(submittedUrl);
       const duplicate = downloads.find(
         (download) =>
@@ -346,12 +375,17 @@ function App() {
       if (duplicate) {
         setNoticeMessage(`${duplicate.filename} is already in your download list.`);
         if (clearInput) setUrl("");
+        if (scheduledStartMs !== null) setScheduleDraft("");
         return;
       }
       const defaultPath = await invoke<string>("suggest_download_destination", { url: submittedUrl });
       const destinationPath = await save({ defaultPath, title: "Save download as" });
       if (destinationPath === null) return;
-      const started = await invoke<StartedDownload>("start_download", { url: submittedUrl, destinationPath });
+      const started = await invoke<StartedDownload>("start_download", {
+        url: submittedUrl,
+        destinationPath,
+        scheduledStartMs,
+      });
       if (started.duplicate) {
         setDownloads(await invoke<Download[]>("list_downloads"));
         setNoticeMessage(`${started.filename} is already in your download list.`);
@@ -363,6 +397,7 @@ function App() {
         if (clearInput) setUrl("");
         return;
       }
+      if (scheduledStartMs !== null) setScheduleDraft("");
       const newDownload = { id: started.id, filename: started.filename };
       setDownloads((current) => {
         const existing = current.some((download) => download.id === started.id);
@@ -377,8 +412,9 @@ function App() {
             url: submittedUrl,
             downloadedBytes: 0,
             totalBytes: null,
-            status: "queued",
+            status: scheduledStartMs === null ? "queued" : "scheduled",
             error: null,
+            scheduledStartMs: scheduledStartMs,
           },
           ...current,
         ];
@@ -413,6 +449,18 @@ function App() {
       setErrorMessage(String(error));
     } finally {
       setBusyActionId(null);
+    }
+  }
+
+  async function startScheduledNow(download: Download) {
+    setContextMenu(null);
+    setErrorMessage("");
+    try {
+      await invoke("schedule_download", { id: download.id, scheduledStartMs: null });
+      setDownloads(await invoke<Download[]>("list_downloads"));
+      setNoticeMessage("Scheduled download started.");
+    } catch (error) {
+      setErrorMessage(String(error));
     }
   }
 
@@ -566,6 +614,36 @@ function App() {
     }
   }
 
+  async function saveBandwidthLimits() {
+    const parseKbps = (value: string, label: string): number | null => {
+      if (!value.trim()) return null;
+      const kilobytes = Number(value);
+      if (!Number.isFinite(kilobytes) || kilobytes < 0 || kilobytes > 10_485_760) {
+        throw new Error(`${label} must be between 0 and 10,485,760 KB/s, or empty for unlimited.`);
+      }
+      return kilobytes === 0 ? null : Math.round(kilobytes * 1024);
+    };
+    setSettingsError("");
+    try {
+      const saved = await invoke<DownloadSettings>("set_bandwidth_limits", {
+        globalBandwidthLimitBps: parseKbps(globalBandwidthDraft, "Global speed limit"),
+        perDownloadBandwidthLimitBps: parseKbps(perDownloadBandwidthDraft, "Per-download speed limit"),
+      });
+      setGlobalBandwidthDraft(
+        saved.globalBandwidthLimitBps === null
+          ? ""
+          : String(Math.round(saved.globalBandwidthLimitBps / 1024)),
+      );
+      setPerDownloadBandwidthDraft(
+        saved.perDownloadBandwidthLimitBps === null
+          ? ""
+          : String(Math.round(saved.perDownloadBandwidthLimitBps / 1024)),
+      );
+    } catch (error) {
+      setSettingsError(String(error));
+    }
+  }
+
   async function saveFileExistsPolicy(policy: FileExistsPolicy) {
     setFilePolicyError("");
     setIsSavingFilePolicy(true);
@@ -712,6 +790,42 @@ function App() {
               </section>
               <section className="settings-card">
                 <div className="settings-copy">
+                  <h2>Speed limits</h2>
+                  <p>Set global and per-download limits. Empty or zero means unlimited.</p>
+                </div>
+                <label className="settings-field" htmlFor="global-bandwidth-limit">
+                  <span>Global limit (KB/s)</span>
+                  <input
+                    id="global-bandwidth-limit"
+                    min={0}
+                    onChange={(event) => setGlobalBandwidthDraft(event.currentTarget.value)}
+                    placeholder="Unlimited"
+                    type="number"
+                    value={globalBandwidthDraft}
+                  />
+                </label>
+                <label className="settings-field" htmlFor="download-bandwidth-limit">
+                  <span>Per-download limit (KB/s)</span>
+                  <input
+                    id="download-bandwidth-limit"
+                    min={0}
+                    onChange={(event) => setPerDownloadBandwidthDraft(event.currentTarget.value)}
+                    placeholder="Unlimited"
+                    type="number"
+                    value={perDownloadBandwidthDraft}
+                  />
+                </label>
+                {settingsError && <p className="settings-error" role="alert">{settingsError}</p>}
+                <button
+                  className="start-button settings-save"
+                  onClick={() => void saveBandwidthLimits()}
+                  type="button"
+                >
+                  Save speed limits
+                </button>
+              </section>
+              <section className="settings-card">
+                <div className="settings-copy">
                   <h2>Diagnostics</h2>
                   <p>Save a report with app details, settings, and recent redacted logs.</p>
                 </div>
@@ -748,6 +862,15 @@ function App() {
                     value={url}
                     required
                   />
+                  <label className="schedule-field">
+                    <span>Start at</span>
+                    <input
+                      aria-label="Scheduled start time"
+                      onChange={(event) => setScheduleDraft(event.currentTarget.value)}
+                      type="datetime-local"
+                      value={scheduleDraft}
+                    />
+                  </label>
                   <button className="start-button" disabled={isStarting} type="submit">
                     <Icon name="plus" />
                     {isStarting ? "Choosing location…" : "Add download"}
@@ -957,6 +1080,23 @@ function App() {
                       style={{ left: contextMenu.x, top: contextMenu.y }}
                       onClick={(event) => event.stopPropagation()}
                     >
+                      {download.status === "scheduled" && (
+                        <button onClick={() => void startScheduledNow(download)} role="menuitem" type="button">
+                          <Icon name="play" />
+                          Start now
+                        </button>
+                      )}
+                      {download.status === "scheduled" && (
+                        <button
+                          className="danger-menu-item"
+                          onClick={() => runAction("cancel")}
+                          role="menuitem"
+                          type="button"
+                        >
+                          <Icon name="cancel" />
+                          Cancel
+                        </button>
+                      )}
                       {download.status === "paused" && (
                         <button onClick={() => runAction("resume")} role="menuitem" type="button">
                           <Icon name="play" />

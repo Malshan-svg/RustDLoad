@@ -25,6 +25,7 @@ const MAX_SEGMENTS_PER_DOWNLOAD: usize = 4;
 const MIN_SEGMENTED_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_NETWORK_RETRIES: u32 = 6;
 const MAX_FILENAME_UTF16_UNITS: usize = 240;
+const MAX_BANDWIDTH_BYTES_PER_SECOND: u64 = 10 * 1024 * 1024 * 1024;
 const PERSISTED_FORMAT_VERSION: u32 = 1;
 const SEGMENT_RESUME_VERSION: u32 = 1;
 #[cfg(not(test))]
@@ -145,6 +146,7 @@ struct DownloadSnapshot {
     total_bytes: Option<u64>,
     status: String,
     error: Option<String>,
+    scheduled_start_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,6 +185,7 @@ struct DownloadDetails {
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
     resume_supported: Option<bool>,
+    scheduled_start_ms: Option<u64>,
     status: String,
     last_error: Option<String>,
     events: Vec<DownloadEvent>,
@@ -233,6 +236,7 @@ struct DownloadEntry {
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
     resume_supported: Option<bool>,
+    scheduled_start_ms: Option<u64>,
     events: VecDeque<DownloadEvent>,
     auto_offline: bool,
     control: watch::Sender<Control>,
@@ -247,6 +251,7 @@ struct DownloadManager {
     settings_file: Option<PathBuf>,
     settings_lock: Arc<Mutex<()>>,
     admission: Arc<DownloadAdmission>,
+    bandwidth: Arc<BandwidthLimiter>,
 }
 
 struct AdmissionState {
@@ -258,6 +263,144 @@ struct AdmissionState {
 struct DownloadAdmission {
     state: Mutex<AdmissionState>,
     changed: Notify,
+}
+
+struct TokenBucket {
+    rate_bps: u64,
+    capacity: f64,
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate_bps: u64) -> Self {
+        let capacity = (rate_bps as f64).clamp(64.0 * 1024.0, 1024.0 * 1024.0);
+        Self {
+            rate_bps,
+            capacity,
+            tokens: capacity,
+            updated_at: Instant::now(),
+        }
+    }
+
+    fn refill_and_wait(&mut self, bytes: usize) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.updated_at).as_secs_f64();
+        self.updated_at = now;
+        self.tokens = (self.tokens + elapsed * self.rate_bps as f64).min(self.capacity);
+        let bytes = bytes as f64;
+        if self.tokens >= bytes {
+            self.tokens -= bytes;
+            Duration::ZERO
+        } else {
+            let deficit = bytes - self.tokens;
+            self.tokens = 0.0;
+            Duration::from_secs_f64((deficit / self.rate_bps as f64).min(3600.0))
+        }
+    }
+}
+
+struct BandwidthLimiter {
+    global_limit_bps: Mutex<Option<u64>>,
+    per_download_limit_bps: Mutex<Option<u64>>,
+    global_bucket: Mutex<TokenBucket>,
+    download_buckets: Mutex<HashMap<String, TokenBucket>>,
+}
+
+impl BandwidthLimiter {
+    fn new(global_limit_bps: Option<u64>, per_download_limit_bps: Option<u64>) -> Self {
+        let global_bucket = TokenBucket::new(global_limit_bps.unwrap_or(1));
+        Self {
+            global_limit_bps: Mutex::new(global_limit_bps),
+            per_download_limit_bps: Mutex::new(per_download_limit_bps),
+            global_bucket: Mutex::new(global_bucket),
+            download_buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn set_limits(
+        &self,
+        global_limit_bps: Option<u64>,
+        per_download_limit_bps: Option<u64>,
+    ) -> Result<(), String> {
+        *self
+            .global_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())? = global_limit_bps;
+        *self
+            .per_download_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())? =
+            per_download_limit_bps;
+        if let Some(rate) = global_limit_bps {
+            *self
+                .global_bucket
+                .lock()
+                .map_err(|_| "Bandwidth settings are unavailable.".to_string())? =
+                TokenBucket::new(rate);
+        }
+        self.download_buckets
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())?
+            .clear();
+        Ok(())
+    }
+
+    fn limits(&self) -> Result<(Option<u64>, Option<u64>), String> {
+        let global = *self
+            .global_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())?;
+        let per_download = *self
+            .per_download_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())?;
+        Ok((global, per_download))
+    }
+
+    async fn throttle(&self, id: &str, bytes: usize) -> Result<(), String> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let wait_global = match self
+            .global_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())?
+            .as_ref()
+        {
+            Some(_) => {
+                let mut bucket = self
+                    .global_bucket
+                    .lock()
+                    .map_err(|_| "Bandwidth settings are unavailable.".to_string())?;
+                bucket.refill_and_wait(bytes)
+            }
+            None => Duration::ZERO,
+        };
+        let wait_per_download = match self
+            .per_download_limit_bps
+            .lock()
+            .map_err(|_| "Bandwidth settings are unavailable.".to_string())?
+            .as_ref()
+        {
+            Some(rate) => {
+                let mut buckets = self
+                    .download_buckets
+                    .lock()
+                    .map_err(|_| "Bandwidth settings are unavailable.".to_string())?;
+                buckets
+                    .entry(id.to_string())
+                    .or_insert_with(|| TokenBucket::new(*rate))
+                    .refill_and_wait(bytes)
+            }
+            None => Duration::ZERO,
+        };
+        let wait = wait_global.max(wait_per_download);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        Ok(())
+    }
 }
 
 struct DownloadPermit {
@@ -358,6 +501,8 @@ struct PersistedDownload {
     #[serde(default)]
     resume_supported: Option<bool>,
     #[serde(default)]
+    scheduled_start_ms: Option<u64>,
+    #[serde(default)]
     events: VecDeque<DownloadEvent>,
     error: Option<String>,
 }
@@ -370,6 +515,10 @@ struct PersistedSettings {
     max_concurrent_downloads: usize,
     #[serde(default)]
     file_exists_policy: FileExistsPolicy,
+    #[serde(default)]
+    global_bandwidth_limit_bps: Option<u64>,
+    #[serde(default)]
+    per_download_bandwidth_limit_bps: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -392,6 +541,8 @@ enum PersistedQueueDocument {
 struct DownloadSettings {
     max_concurrent_downloads: usize,
     file_exists_policy: FileExistsPolicy,
+    global_bandwidth_limit_bps: Option<u64>,
+    per_download_bandwidth_limit_bps: Option<u64>,
 }
 
 fn validate_max_concurrent_downloads(limit: usize) -> Result<usize, String> {
@@ -401,6 +552,17 @@ fn validate_max_concurrent_downloads(limit: usize) -> Result<usize, String> {
         ));
     }
     Ok(limit)
+}
+
+fn validate_bandwidth_limit(limit: Option<u64>) -> Result<Option<u64>, String> {
+    match limit {
+        None => Ok(None),
+        Some(0) => Ok(None),
+        Some(limit) if limit <= MAX_BANDWIDTH_BYTES_PER_SECOND => Ok(Some(limit)),
+        Some(_) => Err(format!(
+            "Bandwidth limits must be 0 (unlimited) or at most {MAX_BANDWIDTH_BYTES_PER_SECOND} bytes per second."
+        )),
+    }
 }
 
 trait UpdateSink: Send + Sync {
@@ -601,6 +763,7 @@ impl DownloadManager {
                     started_at_ms: entry.started_at_ms,
                     finished_at_ms: entry.finished_at_ms,
                     resume_supported: entry.resume_supported,
+                    scheduled_start_ms: entry.scheduled_start_ms,
                     events: entry.events.clone(),
                     error: entry.error.clone(),
                 })
@@ -659,6 +822,8 @@ fn read_download_settings(path: &Path) -> Result<PersistedSettings, String> {
             return Err("The saved download settings use a newer unsupported format.".to_string());
         }
         validate_max_concurrent_downloads(settings.max_concurrent_downloads)?;
+        validate_bandwidth_limit(settings.global_bandwidth_limit_bps)?;
+        validate_bandwidth_limit(settings.per_download_bandwidth_limit_bps)?;
         Ok(settings)
     };
 
@@ -678,6 +843,8 @@ fn read_download_settings(path: &Path) -> Result<PersistedSettings, String> {
         version: PERSISTED_FORMAT_VERSION,
         max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
         file_exists_policy: FileExistsPolicy::default(),
+        global_bandwidth_limit_bps: None,
+        per_download_bandwidth_limit_bps: None,
     })
 }
 
@@ -690,11 +857,17 @@ fn persist_download_settings(
     path: &Path,
     limit: usize,
     file_exists_policy: FileExistsPolicy,
+    global_bandwidth_limit_bps: Option<u64>,
+    per_download_bandwidth_limit_bps: Option<u64>,
 ) -> Result<(), String> {
     let settings = PersistedSettings {
         version: PERSISTED_FORMAT_VERSION,
         max_concurrent_downloads: validate_max_concurrent_downloads(limit)?,
         file_exists_policy,
+        global_bandwidth_limit_bps: validate_bandwidth_limit(global_bandwidth_limit_bps)?,
+        per_download_bandwidth_limit_bps: validate_bandwidth_limit(
+            per_download_bandwidth_limit_bps,
+        )?,
     };
     let serialized = serde_json::to_vec_pretty(&settings)
         .map_err(|error| format!("Could not serialize download settings: {error}"))?;
@@ -703,10 +876,20 @@ fn persist_download_settings(
 
 #[cfg(test)]
 fn persist_max_concurrent_downloads(path: &Path, limit: usize) -> Result<(), String> {
-    let file_exists_policy = read_download_settings(path)
-        .map(|settings| settings.file_exists_policy)
-        .unwrap_or_default();
-    persist_download_settings(path, limit, file_exists_policy)
+    let settings = read_download_settings(path).unwrap_or(PersistedSettings {
+        version: PERSISTED_FORMAT_VERSION,
+        max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+        file_exists_policy: FileExistsPolicy::default(),
+        global_bandwidth_limit_bps: None,
+        per_download_bandwidth_limit_bps: None,
+    });
+    persist_download_settings(
+        path,
+        limit,
+        settings.file_exists_policy,
+        settings.global_bandwidth_limit_bps,
+        settings.per_download_bandwidth_limit_bps,
+    )
 }
 
 struct TracingLogGuard {
@@ -830,6 +1013,8 @@ fn write_diagnostics_report(
     app_data_dir: &Path,
     max_concurrent_downloads: usize,
     file_exists_policy: FileExistsPolicy,
+    global_bandwidth_limit_bps: Option<u64>,
+    per_download_bandwidth_limit_bps: Option<u64>,
 ) -> Result<PathBuf, String> {
     let log_lines = recent_log_lines(&app_data_dir.join("logs"), 100)?;
     let report_dir = app_data_dir.join("diagnostics");
@@ -837,11 +1022,13 @@ fn write_diagnostics_report(
         .map_err(|error| format!("Could not create the diagnostics folder: {error}"))?;
     let report_path = report_dir.join(format!("rustdload-diagnostics-{}.txt", now_ms()));
     let mut report = format!(
-        "RustDLoad diagnostics\nVersion: {}\nOS: {}\nSettings:\n  maxConcurrentDownloads: {}\n  fileExistsPolicy: {:?}\nRecent log lines ({}):\n",
+        "RustDLoad diagnostics\nVersion: {}\nOS: {}\nSettings:\n  maxConcurrentDownloads: {}\n  fileExistsPolicy: {:?}\n  globalBandwidthLimitBps: {:?}\n  perDownloadBandwidthLimitBps: {:?}\nRecent log lines ({}):\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         max_concurrent_downloads,
         file_exists_policy,
+        global_bandwidth_limit_bps,
+        per_download_bandwidth_limit_bps,
         log_lines.len()
     );
     for line in log_lines {
@@ -870,6 +1057,8 @@ fn restore_download_manager(
             version: PERSISTED_FORMAT_VERSION,
             max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
             file_exists_policy: FileExistsPolicy::default(),
+            global_bandwidth_limit_bps: None,
+            per_download_bandwidth_limit_bps: None,
         }
     });
     let manager = DownloadManager {
@@ -881,6 +1070,10 @@ fn restore_download_manager(
         admission: Arc::new(DownloadAdmission::with_file_exists_policy(
             settings.max_concurrent_downloads,
             settings.file_exists_policy,
+        )),
+        bandwidth: Arc::new(BandwidthLimiter::new(
+            settings.global_bandwidth_limit_bps,
+            settings.per_download_bandwidth_limit_bps,
         )),
     };
     let mut resumable = Vec::new();
@@ -1052,6 +1245,7 @@ fn restore_download_manager(
                     started_at_ms: record.started_at_ms,
                     finished_at_ms: record.finished_at_ms,
                     resume_supported: record.resume_supported,
+                    scheduled_start_ms: record.scheduled_start_ms,
                     events: record.events.clone(),
                     auto_offline: false,
                     control: sender,
@@ -1273,6 +1467,7 @@ fn reconcile_persisted_status(
             record.error = None;
             true
         }
+        "scheduled" => false,
         "completed"
             if completed_size == Some(record.downloaded_bytes)
                 && record
@@ -2532,6 +2727,9 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
                 Ok(Some(Ok(chunk))) => {
                     if written.saturating_add(chunk.len() as u64) > segment_end - position + 1 {
                         return SegmentWorkerResult::Invalid;
+                    }
+                    if let Err(error) = manager.bandwidth.throttle(&id, chunk.len()).await {
+                        return SegmentWorkerResult::Failed(error);
                     }
                     if let Err(error) = file.write_all(&chunk).await {
                         return SegmentWorkerResult::Failed(disk_error_message(
@@ -3852,6 +4050,10 @@ async fn download_file_inner(
             tokio::select! {
                 chunk = tokio::time::timeout(STALL_TIMEOUT, stream.next()) => match chunk {
                     Ok(Some(Ok(chunk))) => {
+                        if let Err(error) = manager.bandwidth.throttle(&id, chunk.len()).await {
+                            stream_error = Some((error, false, false));
+                            break;
+                        }
                         if let Err(error) = file.write_all(&chunk).await {
                             stream_error = Some((disk_error_message("Disk write failed", error), false, false));
                             break;
@@ -4216,8 +4418,14 @@ async fn start_download(
     manager: State<'_, DownloadManager>,
     url: String,
     destination_path: String,
+    scheduled_start_ms: Option<u64>,
 ) -> Result<StartedDownload, String> {
     let parsed_url = parse_http_download_url(&url)?;
+    if let Some(start_ms) = scheduled_start_ms
+        && start_ms <= now_ms()
+    {
+        return Err("The scheduled start time must be in the future.".to_string());
+    }
 
     let mut destination = resolve_destination(Path::new(&destination_path))?;
     let mut filename = destination
@@ -4231,7 +4439,12 @@ async fn start_download(
     let file_exists_policy = manager.admission.file_exists_policy()?;
     let id = Uuid::new_v4().to_string();
 
-    let (sender, receiver) = watch::channel(Control::Running);
+    let scheduled = scheduled_start_ms.is_some();
+    let (sender, receiver) = watch::channel(if scheduled {
+        Control::Paused
+    } else {
+        Control::Running
+    });
     {
         let mut entries = manager
             .entries
@@ -4301,7 +4514,7 @@ async fn start_download(
                     &filename_from_url(&parsed_url),
                 ),
                 file_exists_policy,
-                status: "queued".to_string(),
+                status: if scheduled { "scheduled" } else { "queued" }.to_string(),
                 downloaded_bytes: 0,
                 total_bytes: None,
                 validator: None,
@@ -4315,6 +4528,7 @@ async fn start_download(
                 started_at_ms: None,
                 finished_at_ms: None,
                 resume_supported: None,
+                scheduled_start_ms,
                 events: VecDeque::new(),
                 auto_offline: false,
                 control: sender,
@@ -4323,20 +4537,23 @@ async fn start_download(
         );
     }
     let path = partial_path_for(&destination, &id);
-    publish_update!(&app, &manager, &id, &filename, "queued", 0, None, None);
-
-    let app_handle = app.clone();
-    let task_manager = manager.inner().clone();
-    let download = DownloadContext {
-        id: id.clone(),
-        url: parsed_url.to_string(),
-        filename: filename.clone(),
-        destination: destination.clone(),
-        partial_path: path,
-    };
-    tauri::async_runtime::spawn(async move {
-        download_file(app_handle, task_manager, download, receiver).await;
-    });
+    if scheduled {
+        publish_update!(&app, &manager, &id, &filename, "scheduled", 0, None, None);
+    } else {
+        publish_update!(&app, &manager, &id, &filename, "queued", 0, None, None);
+        let app_handle = app.clone();
+        let task_manager = manager.inner().clone();
+        let download = DownloadContext {
+            id: id.clone(),
+            url: parsed_url.to_string(),
+            filename: filename.clone(),
+            destination: destination.clone(),
+            partial_path: path,
+        };
+        tauri::async_runtime::spawn(async move {
+            download_file(app_handle, task_manager, download, receiver).await;
+        });
+    }
 
     Ok(StartedDownload {
         id,
@@ -4362,6 +4579,7 @@ fn list_downloads(manager: State<'_, DownloadManager>) -> Result<Vec<DownloadSna
             total_bytes: entry.total_bytes,
             status: entry.status.clone(),
             error: entry.error.clone(),
+            scheduled_start_ms: entry.scheduled_start_ms,
         })
         .collect();
     downloads.sort_by(|left, right| left.id.cmp(&right.id));
@@ -4394,6 +4612,7 @@ fn download_details(manager: &DownloadManager, id: &str) -> Result<DownloadDetai
             started_at_ms: entry.started_at_ms,
             finished_at_ms: entry.finished_at_ms,
             resume_supported: entry.resume_supported,
+            scheduled_start_ms: entry.scheduled_start_ms,
             status: entry.status.clone(),
             last_error: entry.error.clone(),
             events: entry.events.iter().cloned().collect(),
@@ -5139,9 +5358,13 @@ fn remove_from_list_inner(
 
 #[tauri::command]
 fn get_download_settings(manager: State<'_, DownloadManager>) -> Result<DownloadSettings, String> {
+    let (global_bandwidth_limit_bps, per_download_bandwidth_limit_bps) =
+        manager.bandwidth.limits()?;
     Ok(DownloadSettings {
         max_concurrent_downloads: manager.admission.limit()?,
         file_exists_policy: manager.admission.file_exists_policy()?,
+        global_bandwidth_limit_bps,
+        per_download_bandwidth_limit_bps,
     })
 }
 
@@ -5157,12 +5380,15 @@ fn set_max_concurrent_downloads(
         .map_err(|_| "Download settings are unavailable.".to_string())?;
     let file_exists_policy = manager.admission.file_exists_policy()?;
     if let Some(path) = manager.settings_file.as_deref() {
-        persist_download_settings(path, limit, file_exists_policy)?;
+        let (global, per_download) = manager.bandwidth.limits()?;
+        persist_download_settings(path, limit, file_exists_policy, global, per_download)?;
     }
     manager.admission.set_limit(limit)?;
     Ok(DownloadSettings {
         max_concurrent_downloads: limit,
         file_exists_policy,
+        global_bandwidth_limit_bps: manager.bandwidth.limits()?.0,
+        per_download_bandwidth_limit_bps: manager.bandwidth.limits()?.1,
     })
 }
 
@@ -5177,12 +5403,41 @@ fn set_file_exists_policy(
         .map_err(|_| "Download settings are unavailable.".to_string())?;
     let limit = manager.admission.limit()?;
     if let Some(path) = manager.settings_file.as_deref() {
-        persist_download_settings(path, limit, policy)?;
+        let (global, per_download) = manager.bandwidth.limits()?;
+        persist_download_settings(path, limit, policy, global, per_download)?;
     }
     manager.admission.set_file_exists_policy(policy)?;
     Ok(DownloadSettings {
         max_concurrent_downloads: limit,
         file_exists_policy: policy,
+        global_bandwidth_limit_bps: manager.bandwidth.limits()?.0,
+        per_download_bandwidth_limit_bps: manager.bandwidth.limits()?.1,
+    })
+}
+
+#[tauri::command]
+fn set_bandwidth_limits(
+    manager: State<'_, DownloadManager>,
+    global_bandwidth_limit_bps: Option<u64>,
+    per_download_bandwidth_limit_bps: Option<u64>,
+) -> Result<DownloadSettings, String> {
+    let global = validate_bandwidth_limit(global_bandwidth_limit_bps)?;
+    let per_download = validate_bandwidth_limit(per_download_bandwidth_limit_bps)?;
+    let _settings_guard = manager
+        .settings_lock
+        .lock()
+        .map_err(|_| "Download settings are unavailable.".to_string())?;
+    let limit = manager.admission.limit()?;
+    let policy = manager.admission.file_exists_policy()?;
+    if let Some(path) = manager.settings_file.as_deref() {
+        persist_download_settings(path, limit, policy, global, per_download)?;
+    }
+    manager.bandwidth.set_limits(global, per_download)?;
+    Ok(DownloadSettings {
+        max_concurrent_downloads: limit,
+        file_exists_policy: policy,
+        global_bandwidth_limit_bps: global,
+        per_download_bandwidth_limit_bps: per_download,
     })
 }
 
@@ -5193,16 +5448,135 @@ fn export_diagnostics(manager: State<'_, DownloadManager>) -> Result<String, Str
         .as_deref()
         .and_then(Path::parent)
         .ok_or_else(|| "The application data folder is unavailable.".to_string())?;
+    let (global, per_download) = manager.bandwidth.limits()?;
     let report_path = write_diagnostics_report(
         app_data_dir,
         manager.admission.limit()?,
         manager.admission.file_exists_policy()?,
+        global,
+        per_download,
     )?;
     Ok(report_path.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+fn schedule_download(
+    app: AppHandle,
+    manager: State<'_, DownloadManager>,
+    id: String,
+    scheduled_start_ms: Option<u64>,
+) -> Result<(), String> {
+    validate_download_id(&id)?;
+    if let Some(start_ms) = scheduled_start_ms
+        && start_ms <= now_ms()
+    {
+        return Err("The scheduled start time must be in the future.".to_string());
+    }
+
+    let (filename, destination, url, receiver) = {
+        let mut entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get_mut(&id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if matches!(
+            entry.status.as_str(),
+            "completed" | "failed" | "cancelled" | "link-expired"
+        ) {
+            return Err("A terminal download cannot be scheduled.".to_string());
+        }
+        entry.scheduled_start_ms = scheduled_start_ms;
+        if scheduled_start_ms.is_some() {
+            entry.status = "scheduled".to_string();
+            entry.error = None;
+            entry.control.send_replace(Control::Paused);
+        } else {
+            entry.status = "queued".to_string();
+            entry.error = None;
+            entry.scheduled_start_ms = None;
+            entry.control.send_replace(Control::Running);
+        }
+        (
+            entry.filename.clone(),
+            entry.destination.clone(),
+            entry.url.clone(),
+            entry.control.subscribe(),
+        )
+    };
+    manager.persist()?;
+    if scheduled_start_ms.is_some() {
+        publish_update!(&app, &manager, &id, &filename, "scheduled", 0, None, None,);
+    } else {
+        let download = DownloadContext {
+            id: id.clone(),
+            url,
+            filename: filename.clone(),
+            destination: destination.clone(),
+            partial_path: partial_path_for(&destination, &id),
+        };
+        let task_manager = manager.inner().clone();
+        publish_update!(&app, &manager, &id, &filename, "queued", 0, None, None,);
+        tauri::async_runtime::spawn(async move {
+            download_file(app, task_manager, download, receiver).await;
+        });
+    }
+    Ok(())
+}
+
+fn start_due_scheduled_downloads(app: &AppHandle, manager: &DownloadManager) {
+    let now = now_ms();
+    let due = {
+        let mut entries = match manager.entries.lock() {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        let mut due = Vec::new();
+        for (id, entry) in entries.iter_mut() {
+            if entry.status != "scheduled"
+                || entry
+                    .scheduled_start_ms
+                    .is_none_or(|scheduled| scheduled > now)
+            {
+                continue;
+            }
+            entry.status = "queued".to_string();
+            entry.error = None;
+            entry.control.send_replace(Control::Running);
+            due.push((
+                id.clone(),
+                entry.url.clone(),
+                entry.filename.clone(),
+                entry.destination.clone(),
+                entry.control.subscribe(),
+            ));
+        }
+        if let Err(error) = manager.persist() {
+            eprintln!("{error}");
+        }
+        due
+    };
+    for (id, url, filename, destination, receiver) in due {
+        let download = DownloadContext {
+            id: id.clone(),
+            url,
+            filename: filename.clone(),
+            destination: destination.clone(),
+            partial_path: partial_path_for(&destination, &id),
+        };
+        publish_update!(app, manager, &id, &filename, "queued", 0, None, None,);
+        let task_app = app.clone();
+        let task_manager = manager.clone();
+        tauri::async_runtime::spawn(async move {
+            download_file(task_app, task_manager, download, receiver).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::BandwidthLimiter;
     #[cfg(target_os = "windows")]
     use super::mark_of_the_web;
     use super::{
@@ -5575,6 +5949,7 @@ mod tests {
                     started_at_ms: None,
                     finished_at_ms: None,
                     resume_supported: None,
+                    scheduled_start_ms: None,
                     events: VecDeque::new(),
                     auto_offline: false,
                     control: control_sender.clone(),
@@ -5588,6 +5963,7 @@ mod tests {
                 settings_file: None,
                 settings_lock: Arc::default(),
                 admission: Arc::new(DownloadAdmission::new(3)),
+                bandwidth: Arc::new(BandwidthLimiter::new(None, None)),
             };
             Self {
                 id,
@@ -5748,8 +6124,14 @@ mod tests {
         )
         .unwrap();
 
-        let report_path =
-            write_diagnostics_report(&directory, 4, FileExistsPolicy::Overwrite).unwrap();
+        let report_path = write_diagnostics_report(
+            &directory,
+            4,
+            FileExistsPolicy::Overwrite,
+            Some(1024),
+            Some(512),
+        )
+        .unwrap();
         let report = std::fs::read_to_string(report_path).unwrap();
         assert!(report.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION"))));
         assert!(report.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -6518,6 +6900,7 @@ mod tests {
             started_at_ms: None,
             finished_at_ms: None,
             resume_supported: None,
+            scheduled_start_ms: None,
             events: VecDeque::new(),
             error: None,
         }
@@ -6599,6 +6982,7 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 resume_supported: None,
+                scheduled_start_ms: None,
                 events: VecDeque::new(),
                 auto_offline: false,
                 control,
@@ -6680,7 +7064,8 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let settings_path = directory.join("settings.json");
 
-        persist_download_settings(&settings_path, 5, FileExistsPolicy::Overwrite).unwrap();
+        persist_download_settings(&settings_path, 5, FileExistsPolicy::Overwrite, None, None)
+            .unwrap();
         let settings = read_download_settings(&settings_path).unwrap();
         assert_eq!(settings.max_concurrent_downloads, 5);
         assert_eq!(settings.file_exists_policy, FileExistsPolicy::Overwrite);
@@ -6690,6 +7075,51 @@ mod tests {
         assert_eq!(settings.max_concurrent_downloads, 2);
         assert_eq!(settings.file_exists_policy, FileExistsPolicy::Overwrite);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bandwidth_limits_validate_and_persist() {
+        assert_eq!(super::validate_bandwidth_limit(None).unwrap(), None);
+        assert_eq!(super::validate_bandwidth_limit(Some(0)).unwrap(), None);
+        assert_eq!(
+            super::validate_bandwidth_limit(Some(1024 * 1024)).unwrap(),
+            Some(1024 * 1024)
+        );
+        assert!(
+            super::validate_bandwidth_limit(Some(super::MAX_BANDWIDTH_BYTES_PER_SECOND + 1))
+                .is_err()
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-bandwidth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let settings_path = directory.join("settings.json");
+        persist_download_settings(
+            &settings_path,
+            3,
+            FileExistsPolicy::Rename,
+            Some(2048),
+            Some(1024),
+        )
+        .unwrap();
+        let settings = read_download_settings(&settings_path).unwrap();
+        assert_eq!(settings.global_bandwidth_limit_bps, Some(2048));
+        assert_eq!(settings.per_download_bandwidth_limit_bps, Some(1024));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scheduled_download_survives_restore_until_due() {
+        let mut scheduled = persisted_download("scheduled", 0);
+        scheduled.scheduled_start_ms = Some(now_ms().saturating_add(60_000));
+        assert!(!reconcile_persisted_status(&mut scheduled, None, None));
+        assert_eq!(scheduled.status, "scheduled");
+        assert!(scheduled.scheduled_start_ms.is_some());
+
+        let mut due = scheduled.clone();
+        due.scheduled_start_ms = Some(now_ms().saturating_sub(1));
+        assert!(!reconcile_persisted_status(&mut due, None, None));
+        assert_eq!(due.status, "scheduled");
     }
 
     #[test]
@@ -6780,6 +7210,8 @@ mod tests {
                 version: super::PERSISTED_FORMAT_VERSION,
                 max_concurrent_downloads: 5,
                 file_exists_policy: FileExistsPolicy::Rename,
+                global_bandwidth_limit_bps: None,
+                per_download_bandwidth_limit_bps: None,
             })
             .unwrap(),
         )
@@ -7633,6 +8065,14 @@ pub fn run() {
                     download_file(task_app, task_manager, download, receiver).await;
                 });
             }
+            let scheduler_app = app.handle().clone();
+            let scheduler_manager = manager.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    start_due_scheduled_downloads(&scheduler_app, &scheduler_manager);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -7653,7 +8093,9 @@ pub fn run() {
             export_diagnostics,
             get_download_settings,
             set_max_concurrent_downloads,
-            set_file_exists_policy
+            set_file_exists_policy,
+            set_bandwidth_limits,
+            schedule_download
         ])
         .plugin(tauri_plugin_dialog::init())
         .build(tauri::generate_context!())

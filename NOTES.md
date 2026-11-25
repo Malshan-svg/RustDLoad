@@ -44,6 +44,8 @@
 - Phase 1, task 8 adds validated rename and removal actions, optional completed-file deletion, default-app opening, and containing-folder opening. Destructive or filesystem actions reject active downloads; rename also moves the resume sidecar and rolls back on persistence errors. Executable and script extensions require an explicit frontend confirmation; URL copying remains frontend-only.
 - Phase 1, task 9 validates download identifiers and URL sizes/schemes, restricts the capability to event listening and the save dialog, and applies a restrictive CSP. Completed Windows downloads receive a `Zone.Identifier` marking them as Internet-originated.
 - Phase 1 completion gate: all 73 Rust tests passed, including Windows Mark-of-the-Web coverage; strict Clippy, Rust formatting, whitespace/config validation, and the frontend production build passed. No live internet downloads were used.
+- Phase 2 scheduling and bandwidth controls persist under the existing versioned settings file. Bandwidth limits are validated as bytes per second, with zero or empty values representing unlimited; token-bucket throttling is applied to sequential and segmented response streams.
+- Scheduled downloads persist an optional future start timestamp and restore as `Scheduled`. A one-second backend monitor starts due entries once a download slot is available. The frontend provides schedule-time selection and "Start now" for scheduled rows.
 
 ## Manual test checklist
 
@@ -59,6 +61,8 @@
 - [ ] Rename and remove completed downloads; confirm remove-without-delete preserves the file and delete-file removes it.
 - [ ] Open a downloaded document and confirm executable/script downloads require an additional warning confirmation.
 - [ ] Export diagnostics and verify report contents are useful while signed URL credentials and query values are absent.
+- [ ] Set global and per-download bandwidth limits and verify local transfers stay near the configured KB/s ceilings.
+- [ ] Schedule a download for a future minute, close and relaunch the app, and confirm it starts automatically when due.
 
 ## Known limitations
 
