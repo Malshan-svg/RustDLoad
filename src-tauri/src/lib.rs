@@ -1771,6 +1771,68 @@ fn validate_download_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkImport {
+    urls: Vec<String>,
+    invalid_lines: Vec<usize>,
+    duplicate_count: usize,
+}
+
+#[tauri::command]
+fn import_download_list(path: String) -> Result<BulkImport, String> {
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err("The selected text file does not exist.".to_string());
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect the text file: {error}"))?;
+    if metadata.len() > 256 * 1024 {
+        return Err("The download list is too large (maximum 256 KB).".to_string());
+    }
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read the text file: {error}"))?;
+    let mut urls = Vec::new();
+    let mut invalid_lines = Vec::new();
+    let mut seen = HashSet::new();
+    let mut duplicate_count = 0;
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_http_download_url(line) {
+            Ok(url) => {
+                let normalized = url.to_string();
+                if seen.insert(normalized.clone()) {
+                    urls.push(normalized);
+                } else {
+                    duplicate_count += 1;
+                }
+            }
+            Err(_) => invalid_lines.push(index + 1),
+        }
+        if urls.len() >= 1000 {
+            break;
+        }
+    }
+    Ok(BulkImport {
+        urls,
+        invalid_lines,
+        duplicate_count,
+    })
+}
+
+#[tauri::command]
+fn suggest_bulk_destination(folder: String, url: String) -> Result<String, String> {
+    let folder = resolve_destination_folder(Path::new(&folder))?;
+    let parsed_url = parse_http_download_url(&url)?;
+    let entries = HashMap::new();
+    suggested_destination(&folder, &filename_from_url(&parsed_url), &entries)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn duplicate_download(
     url: &reqwest::Url,
     entries: &HashMap<String, DownloadEntry>,
@@ -1812,6 +1874,15 @@ fn resolve_destination(destination: &Path) -> Result<PathBuf, String> {
         return Err("The selected download folder is not a directory.".to_string());
     }
     Ok(parent.join(filename))
+}
+
+fn resolve_destination_folder(folder: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(folder)
+        .map_err(|error| format!("Could not access the selected folder: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("The selected download folder is not a directory.".to_string());
+    }
+    Ok(canonical)
 }
 
 fn destinations_equal(left: &Path, right: &Path) -> bool {
@@ -6525,6 +6596,38 @@ mod tests {
     }
 
     #[test]
+    fn bulk_text_import_filters_invalid_urls_and_duplicate_lines() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-bulk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let list_path = directory.join("downloads.txt");
+        std::fs::write(
+            &list_path,
+            "# downloads\nhttps://example.com/a.bin\nftp://example.com/b.bin\nhttps://example.com/a.bin\nhttps://example.com/c.bin\n",
+        )
+        .unwrap();
+
+        let imported =
+            super::import_download_list(list_path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(imported.urls.len(), 2);
+        assert_eq!(imported.duplicate_count, 1);
+        assert_eq!(imported.invalid_lines, vec![3]);
+
+        let destination = super::suggest_bulk_destination(
+            directory.to_string_lossy().into_owned(),
+            imported.urls[0].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&destination)
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok()),
+            std::fs::canonicalize(&directory).ok()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn content_range_requires_valid_bounds_and_total() {
         assert_eq!(parse_content_range("bytes 12-19/42"), Some((12, 19, 42)));
         assert_eq!(parse_content_range("bytes 12-42/42"), None);
@@ -8077,6 +8180,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             suggest_download_destination,
+            import_download_list,
+            suggest_bulk_destination,
             start_download,
             pause_download,
             resume_download,

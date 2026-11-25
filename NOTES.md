@@ -46,6 +46,7 @@
 - Phase 1 completion gate: all 73 Rust tests passed, including Windows Mark-of-the-Web coverage; strict Clippy, Rust formatting, whitespace/config validation, and the frontend production build passed. No live internet downloads were used.
 - Phase 2 scheduling and bandwidth controls persist under the existing versioned settings file. Bandwidth limits are validated as bytes per second, with zero or empty values representing unlimited; token-bucket throttling is applied to sequential and segmented response streams.
 - Scheduled downloads persist an optional future start timestamp and restore as `Scheduled`. A one-second backend monitor starts due entries once a download slot is available. The frontend provides schedule-time selection and "Start now" for scheduled rows.
+- Bulk text import reads up to 256 KB and 1,000 unique HTTP/HTTPS entries, removes duplicate list lines, and reports invalid line numbers. The frontend uses native file/folder dialogs and queues each imported URL into the selected folder with the existing duplicate and file-policy logic.
 
 ## Manual test checklist
 

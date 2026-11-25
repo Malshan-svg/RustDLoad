@@ -23,6 +23,7 @@ A free, open-source download manager built with Rust and Tauri.
 - Choose a persistent maximum of 1–10 concurrent downloads (default: 3); additional jobs wait in the queue.
 - Apply persistent global and per-download bandwidth limits in KB/s; zero or empty means unlimited.
 - Schedule downloads for an exact future start time. Scheduled items survive restart and start automatically when the deadline arrives and a slot is available.
+- Import up to 1,000 HTTP/HTTPS URLs from a local `.txt` or `.text` list, choose one destination folder, and report duplicates, invalid lines, skipped files, and successful additions.
 - Apply limit changes without interrupting running transfers. When lowering the limit, queued jobs wait until the active count is below the new limit.
 - Resume from the saved byte offset when the server supports HTTP Range requests.
 - Use up to four parallel byte-range segments for downloads of at least 2 MiB, writing directly to byte offsets in a preallocated partial file. An atomic `.rdl` sidecar checkpoints each range and validates the final URL, size, and validator before resuming; unsupported or inconsistent ranges restart safely as a sequential download.

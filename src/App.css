@@ -342,6 +342,10 @@ kbd {
   font-size: 12px;
 }
 
+.bulk-import-button {
+  margin-left: 6px;
+}
+
 .start-button {
   display: flex;
   height: 34px;

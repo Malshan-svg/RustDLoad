@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "link-expired" | "cancelled" | "scheduled";
@@ -45,6 +45,11 @@ type DownloadSettings = {
   fileExistsPolicy: FileExistsPolicy;
   globalBandwidthLimitBps: number | null;
   perDownloadBandwidthLimitBps: number | null;
+};
+type BulkImport = {
+  urls: string[];
+  invalidLines: number[];
+  duplicateCount: number;
 };
 type OpenFileOutcome = { confirmationRequired: boolean };
 type TransferSample = { bytes: number; at: number };
@@ -185,6 +190,7 @@ function App() {
   const [clock, setClock] = useState(() => performance.now());
   const [errorMessage, setErrorMessage] = useState("");
   const [isStarting, setIsStarting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
   const [busyActionId, setBusyActionId] = useState<string | null>(null);
   const [page, setPage] = useState<AppPage>("downloads");
   const [maxConcurrentDownloads, setMaxConcurrentDownloads] = useState(3);
@@ -432,6 +438,84 @@ function App() {
     const submittedUrl = url.trim();
     if (!submittedUrl || isStarting) return;
     await enqueueDownload(submittedUrl, true);
+  }
+
+  async function importDownloadList() {
+    if (isImporting) return;
+    setErrorMessage("");
+    setNoticeMessage("");
+    setIsImporting(true);
+    try {
+      const selectedFile = await open({
+        title: "Import download list",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Text files", extensions: ["txt", "text"] }],
+      });
+      if (!selectedFile) return;
+      if (Array.isArray(selectedFile)) return;
+      const textPath = selectedFile;
+      const imported = await invoke<BulkImport>("import_download_list", { path: textPath });
+      if (imported.urls.length === 0) {
+        setNoticeMessage(
+          imported.invalidLines.length > 0
+            ? `No valid HTTP/HTTPS URLs found. Invalid lines: ${imported.invalidLines.join(", ")}`
+            : "The text file contains no download URLs.",
+        );
+        return;
+      }
+
+      const selectedFolder = await open({
+        title: "Choose folder for imported downloads",
+        multiple: false,
+        directory: true,
+      });
+      if (!selectedFolder) return;
+      if (Array.isArray(selectedFolder)) return;
+      const folder = selectedFolder;
+      const scheduledStartMs = scheduleDraft
+        ? new Date(scheduleDraft).getTime()
+        : null;
+      if (scheduledStartMs !== null && (!Number.isFinite(scheduledStartMs) || scheduledStartMs <= Date.now())) {
+        setErrorMessage("Choose a schedule time in the future.");
+        return;
+      }
+
+      let queued = 0;
+      let duplicates = imported.duplicateCount;
+      let skipped = 0;
+      for (const submittedUrl of imported.urls) {
+        try {
+          const destinationPath = await invoke<string>("suggest_bulk_destination", {
+            folder,
+            url: submittedUrl,
+          });
+          const started = await invoke<StartedDownload>("start_download", {
+            url: submittedUrl,
+            destinationPath,
+            scheduledStartMs,
+          });
+          if (started.duplicate) duplicates += 1;
+          else if (started.skipped) skipped += 1;
+          else queued += 1;
+        } catch (error) {
+          console.error(`Could not import ${submittedUrl}:`, error);
+        }
+      }
+      setDownloads(await invoke<Download[]>("list_downloads"));
+      if (scheduledStartMs !== null) setScheduleDraft("");
+      const summary = [
+        `${queued} added`,
+        `${duplicates} duplicate${duplicates === 1 ? "" : "s"}`,
+        `${skipped} skipped`,
+        `${imported.invalidLines.length} invalid line${imported.invalidLines.length === 1 ? "" : "s"}`,
+      ].join(", ");
+      setNoticeMessage(`Bulk import: ${summary}.`);
+    } catch (error) {
+      setErrorMessage(`Could not import download list: ${String(error)}`);
+    } finally {
+      setIsImporting(false);
+    }
   }
 
   async function runDownloadAction(download: Download, action: DownloadAction) {
@@ -876,6 +960,15 @@ function App() {
                     {isStarting ? "Choosing location…" : "Add download"}
                   </button>
                 </form>
+                <button
+                  className="start-button bulk-import-button"
+                  disabled={isImporting}
+                  onClick={() => void importDownloadList()}
+                  type="button"
+                >
+                  <Icon name="queue" />
+                  {isImporting ? "Importing…" : "Import TXT"}
+                </button>
               </div>
 
               {errorMessage && (
