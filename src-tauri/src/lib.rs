@@ -35,6 +35,51 @@ struct DownloadUpdate {
     error: Option<String>,
 }
 
+struct DownloadContext {
+    id: String,
+    url: String,
+    filename: String,
+    destination: PathBuf,
+    partial_path: PathBuf,
+}
+
+struct DownloadFailure<'a> {
+    id: &'a str,
+    filename: &'a str,
+    path: &'a Path,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    message: String,
+}
+
+struct SegmentRequest {
+    client: reqwest::Client,
+    app: Arc<dyn UpdateSink>,
+    manager: DownloadManager,
+    url: String,
+    path: PathBuf,
+    filename: String,
+    id: String,
+    start: u64,
+    end: u64,
+    total: u64,
+    validator: Option<String>,
+    progress: Arc<AtomicU64>,
+    last_progress_update: Arc<Mutex<Instant>>,
+    control: watch::Receiver<Control>,
+}
+
+struct SegmentedDownloadContext<'a> {
+    client: &'a reqwest::Client,
+    app: &'a Arc<dyn UpdateSink>,
+    manager: &'a DownloadManager,
+    id: &'a str,
+    url: &'a str,
+    filename: &'a str,
+    directory: &'a Path,
+    path: &'a Path,
+}
+
 fn remember_validator(manager: &DownloadManager, id: &str, validator: Option<String>) {
     let updated = manager
         .entries
@@ -48,10 +93,8 @@ fn remember_validator(manager: &DownloadManager, id: &str, validator: Option<Str
             }
         })
         .unwrap_or(false);
-    if updated {
-        if let Err(error) = manager.persist() {
-            eprintln!("{error}");
-        }
+    if updated && let Err(error) = manager.persist() {
+        eprintln!("{error}");
     }
 }
 
@@ -427,6 +470,7 @@ fn restore_download_manager(
                     match std::fs::OpenOptions::new()
                         .write(true)
                         .create(true)
+                        .truncate(false)
                         .open(&partial_path)
                     {
                         Ok(_) => Some(0),
@@ -519,10 +563,10 @@ fn remove_stale_segment_directories(download_dir: &Path) {
 
 fn remove_stale_segment_directory(directory: &Path, id: &str) {
     let path = directory.join(format!(".{id}.segments"));
-    if path.is_dir() {
-        if let Err(error) = std::fs::remove_dir_all(path) {
-            eprintln!("Could not remove stale segments for download {id}: {error}");
-        }
+    if path.is_dir()
+        && let Err(error) = std::fs::remove_dir_all(path)
+    {
+        eprintln!("Could not remove stale segments for download {id}: {error}");
     }
 }
 
@@ -597,48 +641,50 @@ fn reconcile_persisted_status(
 fn publish_update<S: UpdateSink + ?Sized>(
     app: &S,
     manager: &DownloadManager,
-    id: &str,
-    filename: &str,
-    status: &str,
-    downloaded_bytes: u64,
-    total_bytes: Option<u64>,
-    error: Option<String>,
+    mut update: DownloadUpdate,
 ) {
-    let status = match update_entry(
+    update.status = match update_entry(
         manager,
-        id,
-        filename,
-        status,
-        downloaded_bytes,
-        total_bytes,
-        error.clone(),
+        &update.id,
+        &update.filename,
+        &update.status,
+        update.downloaded_bytes,
+        update.total_bytes,
+        update.error.clone(),
     ) {
         Ok(status) => status,
         Err(state_error) => {
             eprintln!("{state_error}");
-            status.to_string()
+            update.status.clone()
         }
     };
     if let Err(persist_error) = manager.persist() {
         eprintln!("{persist_error}");
     }
-    emit_update(
-        app,
-        DownloadUpdate {
-            id: id.to_string(),
-            filename: filename.to_string(),
-            downloaded_bytes,
-            total_bytes,
-            status,
-            error,
-        },
-    );
+    emit_update(app, update);
+}
+
+macro_rules! publish_update {
+    ($app:expr, $manager:expr, $id:expr, $filename:expr, $status:expr, $downloaded_bytes:expr, $total_bytes:expr, $error:expr $(,)?) => {
+        publish_update(
+            $app,
+            $manager,
+            DownloadUpdate {
+                id: $id.to_string(),
+                filename: $filename.to_string(),
+                downloaded_bytes: $downloaded_bytes,
+                total_bytes: $total_bytes,
+                status: $status.to_string(),
+                error: $error,
+            },
+        )
+    };
 }
 
 fn filename_from_url(url: &reqwest::Url) -> String {
     let raw = url
         .path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .unwrap_or("download");
     let decoded = percent_decode_str(raw).decode_utf8_lossy();
     let safe: String = decoded
@@ -656,11 +702,11 @@ fn filename_from_url(url: &reqwest::Url) -> String {
             }
         })
         .collect();
-    let safe = safe.trim_end_matches(|character| character == ' ' || character == '.');
+    let safe = safe.trim_end_matches([' ', '.']);
 
     if safe.is_empty() || safe == "." || safe == ".." {
         "download".to_string()
-    } else if is_reserved_windows_name(&safe) {
+    } else if is_reserved_windows_name(safe) {
         format!("_{safe}")
     } else {
         safe.to_string()
@@ -857,10 +903,9 @@ fn response_validator(response: &reqwest::Response) -> Option<String> {
         .headers()
         .get(reqwest::header::ETAG)
         .and_then(|value| value.to_str().ok())
+        && !etag.starts_with("W/")
     {
-        if !etag.starts_with("W/") {
-            return Some(etag.to_string());
-        }
+        return Some(etag.to_string());
     }
     response
         .headers()
@@ -884,13 +929,16 @@ async fn remove_partial_file(path: &Path) -> Result<(), String> {
 async fn finish_failed<S: UpdateSink + ?Sized>(
     app: &S,
     manager: &DownloadManager,
-    id: &str,
-    filename: &str,
-    path: &Path,
-    downloaded_bytes: u64,
-    total_bytes: Option<u64>,
-    message: String,
+    failure: DownloadFailure<'_>,
 ) {
+    let DownloadFailure {
+        id,
+        filename,
+        path,
+        downloaded_bytes,
+        total_bytes,
+        message,
+    } = failure;
     let message = match remove_partial_file(path).await {
         Ok(()) => {
             let cancelled = match manager.entries.lock() {
@@ -904,7 +952,7 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
                 }
             };
             if cancelled {
-                publish_update(
+                publish_update!(
                     app,
                     manager,
                     id,
@@ -920,7 +968,7 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
         }
         Err(cleanup_error) => format!("{message}; {cleanup_error}"),
     };
-    publish_update(
+    publish_update!(
         app,
         manager,
         id,
@@ -930,6 +978,23 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
         total_bytes,
         Some(message),
     );
+}
+
+macro_rules! finish_failed {
+    ($app:expr, $manager:expr, $id:expr, $filename:expr, $path:expr, $downloaded_bytes:expr, $total_bytes:expr, $message:expr $(,)?) => {
+        finish_failed(
+            $app,
+            $manager,
+            DownloadFailure {
+                id: $id,
+                filename: $filename,
+                path: $path,
+                downloaded_bytes: $downloaded_bytes,
+                total_bytes: $total_bytes,
+                message: $message,
+            },
+        )
+    };
 }
 
 enum SlotResult {
@@ -1024,22 +1089,23 @@ fn contiguous_segment_lengths(expected: &[u64], actual: &[Option<u64>]) -> Vec<u
     prefix
 }
 
-async fn fetch_segment(
-    client: reqwest::Client,
-    app: Arc<dyn UpdateSink>,
-    manager: DownloadManager,
-    url: String,
-    path: PathBuf,
-    filename: String,
-    id: String,
-    start: u64,
-    end: u64,
-    total: u64,
-    validator: Option<String>,
-    progress: Arc<AtomicU64>,
-    last_progress_update: Arc<Mutex<Instant>>,
-    mut control: watch::Receiver<Control>,
-) -> SegmentWorkerResult {
+async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
+    let SegmentRequest {
+        client,
+        app,
+        manager,
+        url,
+        path,
+        filename,
+        id,
+        start,
+        end,
+        total,
+        validator,
+        progress,
+        last_progress_update,
+        mut control,
+    } = request;
     if *control.borrow() != Control::Running {
         return SegmentWorkerResult::Controlled(*control.borrow());
     }
@@ -1099,9 +1165,10 @@ async fn fetch_segment(
                     written += chunk.len() as u64;
                     let downloaded = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed)
                         + chunk.len() as u64;
-                    if let Ok(mut last_update) = last_progress_update.lock() {
-                        if last_update.elapsed() >= Duration::from_millis(200) {
-                            publish_update(
+                    if let Ok(mut last_update) = last_progress_update.lock()
+                        && last_update.elapsed() >= Duration::from_millis(200)
+                    {
+                            publish_update!(
                                 &app,
                                 &manager,
                                 &id,
@@ -1112,7 +1179,6 @@ async fn fetch_segment(
                                 None,
                             );
                             *last_update = Instant::now();
-                        }
                     }
                 }
                 Some(Err(_)) => return SegmentWorkerResult::Invalid,
@@ -1138,16 +1204,19 @@ async fn fetch_segment(
 }
 
 async fn try_segmented_download(
-    client: &reqwest::Client,
-    app: &Arc<dyn UpdateSink>,
-    manager: &DownloadManager,
-    id: &str,
-    url: &str,
-    filename: &str,
-    directory: &Path,
-    path: &Path,
+    context: SegmentedDownloadContext<'_>,
     control: &mut watch::Receiver<Control>,
 ) -> Result<SegmentedAttempt, String> {
+    let SegmentedDownloadContext {
+        client,
+        app,
+        manager,
+        id,
+        url,
+        filename,
+        directory,
+        path,
+    } = context;
     if *control.borrow() != Control::Running {
         return Ok(match *control.borrow() {
             Control::Paused => SegmentedAttempt::Paused(0, 0, None),
@@ -1237,7 +1306,7 @@ async fn try_segmented_download(
         .map_err(|error| format!("Could not prepare download segments: {error}"))?;
 
     let ranges = segment_ranges(total, MAX_SEGMENTS_PER_DOWNLOAD);
-    publish_update(
+    publish_update!(
         app,
         manager,
         id,
@@ -1251,22 +1320,22 @@ async fn try_segmented_download(
     let progress = Arc::new(AtomicU64::new(0));
     let last_progress_update = Arc::new(Mutex::new(Instant::now()));
     for (index, (start, end)) in ranges.iter().copied().enumerate() {
-        workers.spawn(fetch_segment(
-            client.clone(),
-            app.clone(),
-            manager.clone(),
-            url.to_string(),
-            segment_directory.join(index.to_string()),
-            filename.to_string(),
-            id.to_string(),
+        workers.spawn(fetch_segment(SegmentRequest {
+            client: client.clone(),
+            app: app.clone(),
+            manager: manager.clone(),
+            url: url.to_string(),
+            path: segment_directory.join(index.to_string()),
+            filename: filename.to_string(),
+            id: id.to_string(),
             start,
             end,
             total,
-            validator.clone(),
-            progress.clone(),
-            last_progress_update.clone(),
-            control.clone(),
-        ));
+            validator: validator.clone(),
+            progress: progress.clone(),
+            last_progress_update: last_progress_update.clone(),
+            control: control.clone(),
+        }));
     }
 
     let mut completed_bytes = 0u64;
@@ -1276,7 +1345,7 @@ async fn try_segmented_download(
             Ok(SegmentWorkerResult::Completed(bytes)) => {
                 completed_bytes += bytes;
                 if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
-                    publish_update(
+                    publish_update!(
                         app,
                         manager,
                         id,
@@ -1417,52 +1486,45 @@ async fn try_segmented_download(
 async fn download_file<R: Runtime>(
     app: AppHandle<R>,
     manager: DownloadManager,
-    id: String,
-    url: String,
-    initial_filename: String,
-    destination: PathBuf,
-    path: PathBuf,
+    download: DownloadContext,
     control: watch::Receiver<Control>,
 ) {
     let task_lock = match manager.entries.lock() {
-        Ok(entries) => entries.get(&id).map(|entry| entry.task_lock.clone()),
+        Ok(entries) => entries
+            .get(&download.id)
+            .map(|entry| entry.task_lock.clone()),
         Err(_) => None,
     };
     let Some(task_lock) = task_lock else {
-        eprintln!("Download {id} disappeared before its transfer could start.");
+        eprintln!(
+            "Download {} disappeared before its transfer could start.",
+            download.id
+        );
         return;
     };
     let _task_guard = task_lock.lock().await;
     let app: Arc<dyn UpdateSink> = Arc::new(app);
-    download_file_inner(
-        app,
-        manager,
-        id,
-        url,
-        initial_filename,
-        destination,
-        path,
-        control,
-    )
-    .await;
+    download_file_inner(app, manager, download, control).await;
 }
 
 async fn download_file_inner(
     app: Arc<dyn UpdateSink>,
     manager: DownloadManager,
-    id: String,
-    url: String,
-    initial_filename: String,
-    destination: PathBuf,
-    path: PathBuf,
+    download: DownloadContext,
     mut control: watch::Receiver<Control>,
 ) {
+    let DownloadContext {
+        id,
+        url,
+        filename,
+        destination,
+        partial_path: path,
+    } = download;
     let client = reqwest::Client::new();
     let directory = destination
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let filename = initial_filename;
     let mut validator = manager
         .entries
         .lock()
@@ -1475,7 +1537,7 @@ async fn download_file_inner(
         let offset = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
             Err(error) => {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1494,7 +1556,7 @@ async fn download_file_inner(
             Ok(SlotResult::Acquired(slot)) => slot,
             Ok(SlotResult::Cancelled) => {
                 if let Err(error) = remove_partial_file(&path).await {
-                    publish_update(
+                    publish_update!(
                         &app,
                         &manager,
                         &id,
@@ -1505,7 +1567,7 @@ async fn download_file_inner(
                         Some(error),
                     );
                 } else {
-                    publish_update(
+                    publish_update!(
                         &app,
                         &manager,
                         &id,
@@ -1519,7 +1581,7 @@ async fn download_file_inner(
                 return;
             }
             Err(error) => {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1533,7 +1595,7 @@ async fn download_file_inner(
                 return;
             }
         };
-        publish_update(
+        publish_update!(
             &app,
             &manager,
             &id,
@@ -1546,14 +1608,16 @@ async fn download_file_inner(
 
         if offset == 0 {
             match try_segmented_download(
-                &client,
-                &app,
-                &manager,
-                &id,
-                &url,
-                &filename,
-                &directory,
-                &path,
+                SegmentedDownloadContext {
+                    client: &client,
+                    app: &app,
+                    manager: &manager,
+                    id: &id,
+                    url: &url,
+                    filename: &filename,
+                    directory: &directory,
+                    path: &path,
+                },
                 &mut control,
             )
             .await
@@ -1561,7 +1625,7 @@ async fn download_file_inner(
                 Ok(SegmentedAttempt::Completed(total)) => {
                     match finalize_file(&destination, &path).await {
                         Ok(()) => {
-                            publish_update(
+                            publish_update!(
                                 &app,
                                 &manager,
                                 &id,
@@ -1573,7 +1637,7 @@ async fn download_file_inner(
                             );
                         }
                         Err(error) => {
-                            finish_failed(
+                            finish_failed!(
                                 &app,
                                 &manager,
                                 &id,
@@ -1594,7 +1658,7 @@ async fn download_file_inner(
                         validator = segment_validator.clone();
                         remember_validator(&manager, &id, segment_validator);
                     }
-                    publish_update(
+                    publish_update!(
                         &app,
                         &manager,
                         &id,
@@ -1608,7 +1672,7 @@ async fn download_file_inner(
                 }
                 Ok(SegmentedAttempt::Cancelled(progress, total)) => {
                     if let Err(error) = remove_partial_file(&path).await {
-                        finish_failed(
+                        finish_failed!(
                             &app,
                             &manager,
                             &id,
@@ -1620,7 +1684,7 @@ async fn download_file_inner(
                         )
                         .await;
                     } else {
-                        publish_update(
+                        publish_update!(
                             &app,
                             &manager,
                             &id,
@@ -1634,7 +1698,7 @@ async fn download_file_inner(
                     return;
                 }
                 Err(error) => {
-                    finish_failed(
+                    finish_failed!(
                         &app,
                         &manager,
                         &id,
@@ -1662,7 +1726,7 @@ async fn download_file_inner(
             result = request.send() => match result {
                 Ok(response) => response,
                 Err(error) => {
-                    finish_failed(
+                    finish_failed!(
                         &app, &manager, &id, &filename, &path, offset, total_bytes, error.to_string()
                     ).await;
                     return;
@@ -1671,14 +1735,14 @@ async fn download_file_inner(
             changed = control.changed() => {
                 if changed.is_err() || *control.borrow() == Control::Cancelled {
                     if let Err(error) = remove_partial_file(&path).await {
-                        finish_failed(&app, &manager, &id, &filename, &path, offset, total_bytes, error).await;
+                        finish_failed!(&app, &manager, &id, &filename, &path, offset, total_bytes, error).await;
                     } else {
-                        publish_update(&app, &manager, &id, &filename, "cancelled", 0, total_bytes, None);
+                        publish_update!(&app, &manager, &id, &filename, "cancelled", 0, total_bytes, None);
                     }
                     return;
                 }
                 if *control.borrow() == Control::Paused {
-                    publish_update(&app, &manager, &id, &filename, "paused", offset, total_bytes, None);
+                    publish_update!(&app, &manager, &id, &filename, "paused", offset, total_bytes, None);
                 }
                 continue;
             }
@@ -1687,7 +1751,7 @@ async fn download_file_inner(
         if can_resume && status_is_range_not_satisfiable(&response) {
             drop(response);
             if let Err(error) = tokio::fs::File::create(&path).await {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1706,7 +1770,7 @@ async fn download_file_inner(
         }
 
         if let Err(error) = response.error_for_status_ref() {
-            finish_failed(
+            finish_failed!(
                 &app,
                 &manager,
                 &id,
@@ -1739,7 +1803,7 @@ async fn download_file_inner(
             if !valid_range || !valid_validator {
                 drop(response);
                 if let Err(error) = tokio::fs::File::create(&path).await {
-                    finish_failed(
+                    finish_failed!(
                         &app,
                         &manager,
                         &id,
@@ -1773,7 +1837,7 @@ async fn download_file_inner(
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_content_range);
             if !matches!(range, Some((0, _, _))) {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1793,7 +1857,7 @@ async fn download_file_inner(
             validator = response_validator(&response);
             true
         } else {
-            finish_failed(
+            finish_failed!(
                 &app,
                 &manager,
                 &id,
@@ -1809,7 +1873,7 @@ async fn download_file_inner(
 
         if truncate {
             if let Err(error) = tokio::fs::File::create(&path).await {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1839,7 +1903,7 @@ async fn download_file_inner(
         {
             Ok(file) => file,
             Err(error) => {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1856,7 +1920,7 @@ async fn download_file_inner(
 
         let mut downloaded_bytes = if truncate { 0 } else { offset };
         let mut stream = response.bytes_stream();
-        publish_update(
+        publish_update!(
             &app,
             &manager,
             &id,
@@ -1880,7 +1944,7 @@ async fn download_file_inner(
                         }
                         downloaded_bytes += chunk.len() as u64;
                         if last_update.elapsed() >= Duration::from_millis(200) {
-                            publish_update(
+                            publish_update!(
                                 &app, &manager, &id, &filename, "downloading",
                                 downloaded_bytes, total_bytes, None,
                             );
@@ -1920,7 +1984,7 @@ async fn download_file_inner(
 
         if cancelled {
             if let Err(error) = remove_partial_file(&path).await {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -1932,7 +1996,7 @@ async fn download_file_inner(
                 )
                 .await;
             } else {
-                publish_update(
+                publish_update!(
                     &app,
                     &manager,
                     &id,
@@ -1950,7 +2014,7 @@ async fn download_file_inner(
             let actual_bytes = match tokio::fs::metadata(&path).await {
                 Ok(metadata) => metadata.len(),
                 Err(error) => {
-                    finish_failed(
+                    finish_failed!(
                         &app,
                         &manager,
                         &id,
@@ -1964,7 +2028,7 @@ async fn download_file_inner(
                     return;
                 }
             };
-            publish_update(
+            publish_update!(
                 &app,
                 &manager,
                 &id,
@@ -1978,7 +2042,7 @@ async fn download_file_inner(
         }
 
         if let Some(error) = stream_error {
-            finish_failed(
+            finish_failed!(
                 &app,
                 &manager,
                 &id,
@@ -1995,7 +2059,7 @@ async fn download_file_inner(
         let actual_bytes = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
             Err(error) => {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -2012,7 +2076,7 @@ async fn download_file_inner(
         if let Some(end) = range_end {
             let expected_segment = end.saturating_sub(offset) + 1;
             if actual_bytes.saturating_sub(if truncate { 0 } else { offset }) != expected_segment {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -2031,7 +2095,7 @@ async fn download_file_inner(
             }
         }
         if total_bytes.is_some_and(|total| total != actual_bytes) {
-            finish_failed(
+            finish_failed!(
                 &app,
                 &manager,
                 &id,
@@ -2046,7 +2110,7 @@ async fn download_file_inner(
         }
         match finalize_file(&destination, &path).await {
             Ok(()) => {
-                publish_update(
+                publish_update!(
                     &app,
                     &manager,
                     &id,
@@ -2058,7 +2122,7 @@ async fn download_file_inner(
                 );
             }
             Err(error) => {
-                finish_failed(
+                finish_failed!(
                     &app,
                     &manager,
                     &id,
@@ -2203,26 +2267,19 @@ async fn start_download(
             },
         );
     }
-    publish_update(&app, &manager, &id, &filename, "queued", 0, None, None);
+    publish_update!(&app, &manager, &id, &filename, "queued", 0, None, None);
 
     let app_handle = app.clone();
     let task_manager = manager.inner().clone();
-    let download_url = parsed_url.to_string();
-    let task_id = id.clone();
-    let task_destination = destination.clone();
-    let task_filename = filename.clone();
+    let download = DownloadContext {
+        id: id.clone(),
+        url: parsed_url.to_string(),
+        filename: filename.clone(),
+        destination: destination.clone(),
+        partial_path: path,
+    };
     tauri::async_runtime::spawn(async move {
-        download_file(
-            app_handle,
-            task_manager,
-            task_id,
-            download_url,
-            task_filename,
-            task_destination,
-            path,
-            receiver,
-        )
-        .await;
+        download_file(app_handle, task_manager, download, receiver).await;
     });
 
     Ok(StartedDownload { id, filename })
@@ -2362,7 +2419,7 @@ async fn retry_download(
     };
     let _task_guard = task_lock.lock().await;
     let retry = prepare_download_retry(&manager, &id)?;
-    publish_update(
+    publish_update!(
         &app,
         &manager,
         &retry.id,
@@ -2374,18 +2431,15 @@ async fn retry_download(
     );
 
     let task_manager = manager.clone();
+    let download = DownloadContext {
+        id: retry.id,
+        url: retry.url,
+        filename: retry.filename,
+        destination: retry.destination,
+        partial_path: retry.partial_path,
+    };
     tauri::async_runtime::spawn(async move {
-        download_file(
-            app,
-            task_manager,
-            retry.id,
-            retry.url,
-            retry.filename,
-            retry.destination,
-            retry.partial_path,
-            retry.control,
-        )
-        .await;
+        download_file(app, task_manager, download, retry.control).await;
     });
     Ok(())
 }
@@ -2457,15 +2511,15 @@ fn set_max_concurrent_downloads(
 #[cfg(test)]
 mod tests {
     use super::{
-        Control, DownloadAdmission, DownloadEntry, DownloadManager, DownloadUpdate,
-        PersistedDownload, PersistedSettings, SlotResult, UpdateSink, acquire_download_slot,
-        contiguous_segment_lengths, download_file_inner, ensure_destination_available,
-        filename_from_url, finalize_file, is_reserved_windows_name, numbered_filename,
-        parse_content_range, partial_path_for, persist_max_concurrent_downloads, persist_snapshot,
-        prepare_download_retry, read_max_concurrent_downloads, read_persisted_queue,
-        reconcile_persisted_status, restore_download_manager, segment_ranges, valid_range_probe,
-        valid_segment_response, validate_max_concurrent_downloads, validate_transition,
-        validators_compatible,
+        Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadManager,
+        DownloadUpdate, PersistedDownload, PersistedSettings, SlotResult, UpdateSink,
+        acquire_download_slot, contiguous_segment_lengths, download_file_inner,
+        ensure_destination_available, filename_from_url, finalize_file, is_reserved_windows_name,
+        numbered_filename, parse_content_range, partial_path_for, persist_max_concurrent_downloads,
+        persist_snapshot, prepare_download_retry, read_max_concurrent_downloads,
+        read_persisted_queue, reconcile_persisted_status, restore_download_manager, segment_ranges,
+        valid_range_probe, valid_segment_response, validate_max_concurrent_downloads,
+        validate_transition, validators_compatible,
     };
     use std::{
         io::{Read, Write},
@@ -2746,11 +2800,13 @@ mod tests {
             download_file_inner(
                 app,
                 manager,
-                id,
-                url,
-                "payload.bin".to_string(),
-                destination,
-                partial_path,
+                DownloadContext {
+                    id,
+                    url,
+                    filename: "payload.bin".to_string(),
+                    destination,
+                    partial_path,
+                },
                 control_receiver,
             )
             .await;
@@ -2977,11 +3033,13 @@ mod tests {
         download_file_inner(
             app,
             test_download.manager.clone(),
-            retry.id,
-            retry.url,
-            retry.filename,
-            retry.destination,
-            retry.partial_path,
+            DownloadContext {
+                id: retry.id,
+                url: retry.url,
+                filename: retry.filename,
+                destination: retry.destination,
+                partial_path: retry.partial_path,
+            },
             retry.control,
         )
         .await;
@@ -3243,11 +3301,13 @@ mod tests {
         download_file_inner(
             app,
             manager,
-            id,
-            server.url.clone(),
-            "custom-name.bin".to_string(),
-            destination.clone(),
-            partial,
+            DownloadContext {
+                id,
+                url: server.url.clone(),
+                filename: "custom-name.bin".to_string(),
+                destination: destination.clone(),
+                partial_path: partial,
+            },
             receiver,
         )
         .await;
@@ -3461,7 +3521,7 @@ pub fn run() {
             let download_dir = app.path().download_dir()?;
             let persistence_file = app_data_dir.join("downloads.json");
             let (manager, recovered) = restore_download_manager(persistence_file, &download_dir)
-                .map_err(|error| std::io::Error::other(error))?;
+                .map_err(std::io::Error::other)?;
             app.manage(manager.clone());
 
             for record in recovered {
@@ -3484,21 +3544,15 @@ pub fn run() {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| download_dir.join(&record.filename));
                 let partial_path = partial_path_for(&destination, &record.id);
-                let task_id = record.id.clone();
-                let task_url = record.url.clone();
-                let task_filename = record.filename.clone();
+                let download = DownloadContext {
+                    id: record.id.clone(),
+                    url: record.url.clone(),
+                    filename: record.filename.clone(),
+                    destination,
+                    partial_path,
+                };
                 tauri::async_runtime::spawn(async move {
-                    download_file(
-                        task_app,
-                        task_manager,
-                        task_id,
-                        task_url,
-                        task_filename,
-                        destination,
-                        partial_path,
-                        receiver,
-                    )
-                    .await;
+                    download_file(task_app, task_manager, download, receiver).await;
                 });
             }
             Ok(())
