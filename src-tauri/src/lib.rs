@@ -24,6 +24,7 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 const MAX_SEGMENTS_PER_DOWNLOAD: usize = 4;
 const MIN_SEGMENTED_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_NETWORK_RETRIES: u32 = 6;
+const MAX_FILENAME_UTF16_UNITS: usize = 240;
 const PERSISTED_FORMAT_VERSION: u32 = 1;
 const SEGMENT_RESUME_VERSION: u32 = 1;
 #[cfg(not(test))]
@@ -152,6 +153,7 @@ struct StartedDownload {
     id: String,
     filename: String,
     duplicate: bool,
+    skipped: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,10 +163,21 @@ enum Control {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FileExistsPolicy {
+    #[default]
+    Rename,
+    Overwrite,
+    Skip,
+}
+
 struct DownloadEntry {
     url: String,
     filename: String,
     destination: PathBuf,
+    auto_filename: bool,
+    file_exists_policy: FileExistsPolicy,
     status: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
@@ -189,6 +202,7 @@ struct DownloadManager {
 struct AdmissionState {
     active: usize,
     limit: usize,
+    file_exists_policy: FileExistsPolicy,
 }
 
 struct DownloadAdmission {
@@ -210,9 +224,18 @@ impl Drop for DownloadPermit {
 }
 
 impl DownloadAdmission {
+    #[cfg(test)]
     fn new(limit: usize) -> Self {
+        Self::with_file_exists_policy(limit, FileExistsPolicy::default())
+    }
+
+    fn with_file_exists_policy(limit: usize, file_exists_policy: FileExistsPolicy) -> Self {
         Self {
-            state: Mutex::new(AdmissionState { active: 0, limit }),
+            state: Mutex::new(AdmissionState {
+                active: 0,
+                limit,
+                file_exists_policy,
+            }),
             changed: Notify::new(),
         }
     }
@@ -232,6 +255,21 @@ impl DownloadAdmission {
         self.changed.notify_waiters();
         Ok(())
     }
+
+    fn file_exists_policy(&self) -> Result<FileExistsPolicy, String> {
+        self.state
+            .lock()
+            .map(|state| state.file_exists_policy)
+            .map_err(|_| "Download settings are unavailable.".to_string())
+    }
+
+    fn set_file_exists_policy(&self, policy: FileExistsPolicy) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|_| "Download settings are unavailable.".to_string())?
+            .file_exists_policy = policy;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -242,6 +280,10 @@ struct PersistedDownload {
     filename: String,
     #[serde(default)]
     destination: Option<String>,
+    #[serde(default)]
+    auto_filename: bool,
+    #[serde(default)]
+    file_exists_policy: FileExistsPolicy,
     status: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
@@ -258,6 +300,8 @@ struct PersistedSettings {
     #[serde(default)]
     version: u32,
     max_concurrent_downloads: usize,
+    #[serde(default)]
+    file_exists_policy: FileExistsPolicy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -279,6 +323,7 @@ enum PersistedQueueDocument {
 #[serde(rename_all = "camelCase")]
 struct DownloadSettings {
     max_concurrent_downloads: usize,
+    file_exists_policy: FileExistsPolicy,
 }
 
 fn validate_max_concurrent_downloads(limit: usize) -> Result<usize, String> {
@@ -363,6 +408,8 @@ impl DownloadManager {
                     url: entry.url.clone(),
                     filename: entry.filename.clone(),
                     destination: Some(entry.destination.to_string_lossy().into_owned()),
+                    auto_filename: entry.auto_filename,
+                    file_exists_policy: entry.file_exists_policy,
                     status: entry.status.clone(),
                     downloaded_bytes: entry.downloaded_bytes,
                     total_bytes: entry.total_bytes,
@@ -414,9 +461,9 @@ fn persist_json(path: &Path, serialized: &[u8], label: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
+fn read_download_settings(path: &Path) -> Result<PersistedSettings, String> {
     let backup_path = path.with_extension("json.bak");
-    let read = |file: &Path| -> Result<usize, String> {
+    let read = |file: &Path| -> Result<PersistedSettings, String> {
         let bytes = std::fs::read(file)
             .map_err(|error| format!("Could not read download settings: {error}"))?;
         let settings: PersistedSettings = serde_json::from_slice(&bytes)
@@ -424,12 +471,13 @@ fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
         if settings.version > PERSISTED_FORMAT_VERSION {
             return Err("The saved download settings use a newer unsupported format.".to_string());
         }
-        validate_max_concurrent_downloads(settings.max_concurrent_downloads)
+        validate_max_concurrent_downloads(settings.max_concurrent_downloads)?;
+        Ok(settings)
     };
 
     if path.exists() {
         match read(path) {
-            Ok(limit) => return Ok(limit),
+            Ok(settings) => return Ok(settings),
             Err(error) if backup_path.exists() => {
                 eprintln!("{error}; trying the previous settings snapshot.");
             }
@@ -439,17 +487,39 @@ fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
     if backup_path.exists() {
         return read(&backup_path);
     }
-    Ok(DEFAULT_MAX_CONCURRENT_DOWNLOADS)
+    Ok(PersistedSettings {
+        version: PERSISTED_FORMAT_VERSION,
+        max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+        file_exists_policy: FileExistsPolicy::default(),
+    })
 }
 
-fn persist_max_concurrent_downloads(path: &Path, limit: usize) -> Result<(), String> {
+#[cfg(test)]
+fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
+    Ok(read_download_settings(path)?.max_concurrent_downloads)
+}
+
+fn persist_download_settings(
+    path: &Path,
+    limit: usize,
+    file_exists_policy: FileExistsPolicy,
+) -> Result<(), String> {
     let settings = PersistedSettings {
         version: PERSISTED_FORMAT_VERSION,
         max_concurrent_downloads: validate_max_concurrent_downloads(limit)?,
+        file_exists_policy,
     };
     let serialized = serde_json::to_vec_pretty(&settings)
         .map_err(|error| format!("Could not serialize download settings: {error}"))?;
     persist_json(path, &serialized, "download settings")
+}
+
+#[cfg(test)]
+fn persist_max_concurrent_downloads(path: &Path, limit: usize) -> Result<(), String> {
+    let file_exists_policy = read_download_settings(path)
+        .map(|settings| settings.file_exists_policy)
+        .unwrap_or_default();
+    persist_download_settings(path, limit, file_exists_policy)
 }
 
 fn restore_download_manager(
@@ -463,18 +533,24 @@ fn restore_download_manager(
     let backup_file = persistence_file.with_extension("json.bak");
     let records = read_persisted_queue(&persistence_file, &backup_file)?;
     let settings_file = persistence_file.with_file_name("settings.json");
-    let max_concurrent_downloads =
-        read_max_concurrent_downloads(&settings_file).unwrap_or_else(|error| {
-            eprintln!("{error}; using the default download limit.");
-            DEFAULT_MAX_CONCURRENT_DOWNLOADS
-        });
+    let settings = read_download_settings(&settings_file).unwrap_or_else(|error| {
+        eprintln!("{error}; using the default download limit.");
+        PersistedSettings {
+            version: PERSISTED_FORMAT_VERSION,
+            max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            file_exists_policy: FileExistsPolicy::default(),
+        }
+    });
     let manager = DownloadManager {
         entries: Arc::default(),
         persistence_file: Some(persistence_file),
         persistence_lock: Arc::default(),
         settings_file: Some(settings_file),
         settings_lock: Arc::default(),
-        admission: Arc::new(DownloadAdmission::new(max_concurrent_downloads)),
+        admission: Arc::new(DownloadAdmission::with_file_exists_policy(
+            settings.max_concurrent_downloads,
+            settings.file_exists_policy,
+        )),
     };
     let mut resumable = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -629,6 +705,8 @@ fn restore_download_manager(
                     url: record.url.clone(),
                     filename: record.filename.clone(),
                     destination,
+                    auto_filename: record.auto_filename,
+                    file_exists_policy: record.file_exists_policy,
                     status: record.status.clone(),
                     downloaded_bytes: record.downloaded_bytes,
                     total_bytes: record.total_bytes,
@@ -932,7 +1010,12 @@ fn filename_from_url(url: &reqwest::Url) -> String {
         .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .unwrap_or("download");
     let decoded = percent_decode_str(raw).decode_utf8_lossy();
-    let safe: String = decoded
+    sanitize_filename(&decoded)
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let safe: String = value
+        .replace("..", "_")
         .chars()
         .map(|character| {
             if character.is_control()
@@ -947,15 +1030,144 @@ fn filename_from_url(url: &reqwest::Url) -> String {
             }
         })
         .collect();
-    let safe = safe.trim_end_matches([' ', '.']);
-
-    if safe.is_empty() || safe == "." || safe == ".." {
+    let safe = safe.trim().trim_end_matches([' ', '.']);
+    let safe = if safe.is_empty() || safe == "." || safe == ".." {
         "download".to_string()
-    } else if is_reserved_windows_name(safe) {
+    } else {
+        truncate_filename(safe, MAX_FILENAME_UTF16_UNITS)
+    };
+    if is_reserved_windows_name(&safe) {
         format!("_{safe}")
     } else {
-        safe.to_string()
+        safe
     }
+}
+
+fn truncate_filename(filename: &str, max_units: usize) -> String {
+    if filename.encode_utf16().count() <= max_units {
+        return filename.to_string();
+    }
+    let path = Path::new(filename);
+    let extension = path.extension().and_then(|part| part.to_str());
+    if let Some(extension) = extension {
+        let suffix = format!(".{extension}");
+        let suffix_units = suffix.encode_utf16().count();
+        if suffix_units < max_units {
+            let stem = path
+                .file_stem()
+                .and_then(|part| part.to_str())
+                .unwrap_or("");
+            let budget = max_units - suffix_units;
+            let mut shortened = String::new();
+            let mut units = 0;
+            for character in stem.chars() {
+                let character_units = character.len_utf16();
+                if units + character_units > budget {
+                    break;
+                }
+                shortened.push(character);
+                units += character_units;
+            }
+            return format!("{shortened}{suffix}");
+        }
+    }
+    let mut shortened = String::new();
+    let mut units = 0;
+    for character in filename.chars() {
+        let character_units = character.len_utf16();
+        if units + character_units > max_units {
+            break;
+        }
+        shortened.push(character);
+        units += character_units;
+    }
+    shortened
+}
+
+fn filename_from_content_disposition(value: &str) -> Option<String> {
+    let mut fallback = None;
+    for parameter in split_header_parameters(value).into_iter().skip(1) {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = unquote_header_value(value.trim());
+        if name.trim().eq_ignore_ascii_case("filename*") {
+            let mut extended_value = value.splitn(3, '\'');
+            let Some(charset) = extended_value.next() else {
+                continue;
+            };
+            let Some(_language) = extended_value.next() else {
+                continue;
+            };
+            let Some(encoded) = extended_value.next() else {
+                continue;
+            };
+            if !charset.eq_ignore_ascii_case("utf-8") {
+                continue;
+            }
+            if let Ok(decoded) = percent_decode_str(encoded).decode_utf8() {
+                return Some(sanitize_header_filename(&decoded));
+            }
+        }
+        if name.trim().eq_ignore_ascii_case("filename") {
+            fallback = Some(sanitize_header_filename(&value));
+        }
+    }
+    fallback
+}
+
+fn sanitize_header_filename(value: &str) -> String {
+    let leaf = value.rsplit(['/', '\\']).next().unwrap_or("");
+    sanitize_filename(leaf)
+}
+
+fn split_header_parameters(value: &str) -> Vec<&str> {
+    let mut parameters = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == ';' && !quoted {
+            parameters.push(&value[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    parameters.push(&value[start..]);
+    parameters
+}
+
+fn unquote_header_value(value: &str) -> String {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    let mut unquoted = String::with_capacity(value.len());
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            unquoted.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            unquoted.push(character);
+        }
+    }
+    if escaped {
+        unquoted.push('\\');
+    }
+    unquoted
+}
+
+fn filename_is_url_suggestion(filename: &str, suggested: &str) -> bool {
+    (0..10_000).any(|number| numbered_filename(suggested, number) == filename)
 }
 
 fn parse_http_download_url(value: &str) -> Result<reqwest::Url, String> {
@@ -979,6 +1191,7 @@ fn duplicate_download(
             id: id.clone(),
             filename: entry.filename.clone(),
             duplicate: true,
+            skipped: false,
         })
     })
 }
@@ -1028,6 +1241,13 @@ fn ensure_destination_available(
     if destination.exists() {
         return Err("A file already exists at the selected destination.".to_string());
     }
+    ensure_destination_not_reserved(destination, entries)
+}
+
+fn ensure_destination_not_reserved(
+    destination: &Path,
+    entries: &HashMap<String, DownloadEntry>,
+) -> Result<(), String> {
     if entries.values().any(|entry| {
         !matches!(entry.status.as_str(), "failed" | "cancelled")
             && destinations_equal(&entry.destination, destination)
@@ -1046,6 +1266,7 @@ fn suggested_destination(
         .map(|number| directory.join(numbered_filename(proposed_filename, number)))
         .find(|candidate| {
             !candidate.exists()
+                && !segment_sidecar_path(candidate).exists()
                 && !entries.values().any(|entry| {
                     !matches!(entry.status.as_str(), "failed" | "cancelled")
                         && destinations_equal(&entry.destination, candidate)
@@ -1054,11 +1275,123 @@ fn suggested_destination(
         .ok_or_else(|| "Could not choose a unique download filename.".to_string())
 }
 
+fn clear_stale_segment_sidecar(destination: &Path) -> Result<(), String> {
+    let sidecar = segment_sidecar_path(destination);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not remove the old segmented checkpoint at {}: {error}",
+            sidecar.display()
+        )),
+    }
+}
+
+async fn apply_response_filename(
+    manager: &DownloadManager,
+    id: &str,
+    proposed_filename: &str,
+) -> Result<Option<(PathBuf, String)>, String> {
+    let (old_destination, old_filename, is_automatic) = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| "The download no longer exists.".to_string())?;
+        (
+            entry.destination.clone(),
+            entry.filename.clone(),
+            entry.auto_filename,
+        )
+    };
+    if !is_automatic || old_filename == proposed_filename {
+        return Ok(None);
+    }
+
+    let directory = old_destination
+        .parent()
+        .ok_or_else(|| "The selected download folder is invalid.".to_string())?;
+    let new_destination = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        (0..10_000)
+            .map(|number| directory.join(numbered_filename(proposed_filename, number)))
+            .find(|candidate| {
+                !candidate.exists()
+                    && !segment_sidecar_path(candidate).exists()
+                    && entries.iter().all(|(entry_id, entry)| {
+                        entry_id == id
+                            || matches!(entry.status.as_str(), "failed" | "cancelled")
+                            || !destinations_equal(&entry.destination, candidate)
+                    })
+            })
+            .ok_or_else(|| {
+                "Could not choose a unique filename from the server response.".to_string()
+            })?
+    };
+    let old_sidecar = segment_sidecar_path(&old_destination);
+    let new_sidecar = segment_sidecar_path(&new_destination);
+    let moved_sidecar = old_sidecar.exists();
+    if moved_sidecar {
+        tokio::fs::rename(&old_sidecar, &new_sidecar)
+            .await
+            .map_err(|error| {
+                format!("Could not update the segmented resume checkpoint: {error}")
+            })?;
+    }
+
+    let new_filename = new_destination
+        .file_name()
+        .and_then(|part| part.to_str())
+        .ok_or_else(|| "The server-provided filename is invalid.".to_string())?
+        .to_string();
+    let update_result = match manager.entries.lock() {
+        Ok(mut entries) => match entries.get_mut(id) {
+            Some(entry) if entry.destination == old_destination => {
+                entry.destination = new_destination.clone();
+                entry.filename = new_filename.clone();
+                entry.auto_filename = false;
+                Ok(())
+            }
+            Some(_) => Err(
+                "The download destination changed while applying the server filename.".to_string(),
+            ),
+            None => Err("The download no longer exists.".to_string()),
+        },
+        Err(_) => Err("Download state is unavailable.".to_string()),
+    };
+    if let Err(error) = update_result {
+        if moved_sidecar {
+            let _ = tokio::fs::rename(&new_sidecar, &old_sidecar).await;
+        }
+        return Err(error);
+    }
+    if let Err(error) = manager.persist() {
+        if let Ok(mut entries) = manager.entries.lock()
+            && let Some(entry) = entries.get_mut(id)
+        {
+            entry.destination = old_destination.clone();
+            entry.filename = old_filename;
+            entry.auto_filename = true;
+        }
+        if moved_sidecar {
+            let _ = tokio::fs::rename(&new_sidecar, &old_sidecar).await;
+        }
+        return Err(error);
+    }
+    Ok(Some((new_destination, new_filename)))
+}
+
 fn is_reserved_windows_name(filename: &str) -> bool {
     let stem = Path::new(filename)
         .file_stem()
         .and_then(|part| part.to_str())
         .unwrap_or("")
+        .trim_end_matches([' ', '.'])
         .to_ascii_uppercase();
     matches!(
         stem.as_str(),
@@ -1075,6 +1408,9 @@ fn is_reserved_windows_name(filename: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -1084,6 +1420,9 @@ fn is_reserved_windows_name(filename: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     )
 }
 
@@ -1499,7 +1838,66 @@ async fn acquire_download_slot(
     }
 }
 
+#[cfg(test)]
 async fn finalize_file(destination: &Path, partial_path: &Path) -> Result<(), String> {
+    finalize_file_with_policy(destination, partial_path, FileExistsPolicy::Rename).await
+}
+
+async fn finalize_file_with_policy(
+    destination: &Path,
+    partial_path: &Path,
+    policy: FileExistsPolicy,
+) -> Result<(), String> {
+    if policy == FileExistsPolicy::Skip && destination.exists() {
+        return Err(
+            "A file already exists at the selected destination; this download was skipped."
+                .to_string(),
+        );
+    }
+    if policy == FileExistsPolicy::Overwrite && destination.exists() {
+        let filename = destination
+            .file_name()
+            .and_then(|part| part.to_str())
+            .unwrap_or("download");
+        let backup = destination.with_file_name(format!(".{filename}.{}.bak", Uuid::new_v4()));
+        tokio::fs::rename(destination, &backup)
+            .await
+            .map_err(|error| {
+                format!("Could not prepare the existing file for replacement: {error}")
+            })?;
+        if let Err(error) = tokio::fs::hard_link(partial_path, destination).await {
+            return match tokio::fs::rename(&backup, destination).await {
+                Ok(()) => Err(format!("Could not replace the existing file: {error}")),
+                Err(restore_error) => Err(format!(
+                    "Could not replace the existing file ({error}) or restore its backup ({restore_error}); the existing file remains at {}.",
+                    backup.display()
+                )),
+            };
+        }
+        if let Err(error) = tokio::fs::remove_file(partial_path).await {
+            if let Err(rollback_error) = tokio::fs::remove_file(destination).await {
+                return Err(format!(
+                    "Could not finalize the download ({error}) or roll back the replacement ({rollback_error}); the previous file remains at {}.",
+                    backup.display()
+                ));
+            }
+            if let Err(restore_error) = tokio::fs::rename(&backup, destination).await {
+                return Err(format!(
+                    "Could not finalize the download ({error}) or restore the existing file ({restore_error}); the existing file remains at {}.",
+                    backup.display()
+                ));
+            }
+            return Err(format!("Could not finalize the download: {error}"));
+        }
+        if let Err(error) = tokio::fs::remove_file(&backup).await {
+            eprintln!(
+                "The download replaced the existing file, but its backup could not be removed at {}: {error}",
+                backup.display()
+            );
+        }
+        return Ok(());
+    }
+
     tokio::fs::hard_link(partial_path, destination)
         .await
         .map_err(|error| {
@@ -1515,9 +1913,23 @@ async fn finalize_file(destination: &Path, partial_path: &Path) -> Result<(), St
         .map_err(|error| format!("Could not finalize the download: {error}"))
 }
 
+fn download_file_exists_policy(
+    manager: &DownloadManager,
+    id: &str,
+) -> Result<FileExistsPolicy, String> {
+    manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?
+        .get(id)
+        .map(|entry| entry.file_exists_policy)
+        .ok_or_else(|| format!("Download {id} is no longer available."))
+}
+
 enum SegmentedAttempt {
     Completed(u64),
     Fallback,
+    Rename(PathBuf, String),
     Retryable(String, bool),
     Paused(u64, u64, Option<String>),
     Cancelled(u64, u64),
@@ -1922,6 +2334,22 @@ async fn try_segmented_download(
         }
     };
     let probe_status = probe.status();
+    if matches!(
+        probe_status,
+        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
+    ) {
+        let response_filename = probe
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(filename_from_content_disposition);
+        if let Some(response_filename) = response_filename
+            && let Some((destination, filename)) =
+                apply_response_filename(manager, id, &response_filename).await?
+        {
+            return Ok(SegmentedAttempt::Rename(destination, filename));
+        }
+    }
     let probe_range = probe
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
@@ -2200,10 +2628,12 @@ async fn download_file_inner(
     let DownloadContext {
         id,
         url,
-        filename,
-        destination,
+        filename: initial_filename,
+        destination: initial_destination,
         partial_path: path,
     } = download;
+    let mut filename = initial_filename;
+    let mut destination = initial_destination;
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -2224,7 +2654,7 @@ async fn download_file_inner(
             return;
         }
     };
-    let sidecar_path = segment_sidecar_path(&destination);
+    let mut sidecar_path = segment_sidecar_path(&destination);
     let mut validator = manager
         .entries
         .lock()
@@ -2340,7 +2770,24 @@ async fn download_file_inner(
             .await
             {
                 Ok(SegmentedAttempt::Completed(total)) => {
-                    match finalize_file(&destination, &path).await {
+                    let policy = match download_file_exists_policy(&manager, &id) {
+                        Ok(policy) => policy,
+                        Err(error) => {
+                            finish_failed!(
+                                &app,
+                                &manager,
+                                &id,
+                                &filename,
+                                &path,
+                                total,
+                                Some(total),
+                                error,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    match finalize_file_with_policy(&destination, &path, policy).await {
                         Ok(()) => {
                             if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
                                 eprintln!("{error}");
@@ -2374,6 +2821,12 @@ async fn download_file_inner(
                 }
                 Ok(SegmentedAttempt::Fallback) => {
                     force_sequential = true;
+                    continue;
+                }
+                Ok(SegmentedAttempt::Rename(new_destination, new_filename)) => {
+                    destination = new_destination;
+                    filename = new_filename;
+                    sidecar_path = segment_sidecar_path(&destination);
                     continue;
                 }
                 Ok(SegmentedAttempt::Retryable(message, offline)) => {
@@ -2603,6 +3056,36 @@ async fn download_file_inner(
             )
             .await;
             return;
+        }
+
+        let response_filename = response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(filename_from_content_disposition);
+        if let Some(response_filename) = response_filename {
+            match apply_response_filename(&manager, &id, &response_filename).await {
+                Ok(Some((new_destination, new_filename))) => {
+                    destination = new_destination;
+                    filename = new_filename;
+                    sidecar_path = segment_sidecar_path(&destination);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    finish_failed!(
+                        &app,
+                        &manager,
+                        &id,
+                        &filename,
+                        &path,
+                        offset,
+                        total_bytes,
+                        error,
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
 
         let status = response.status();
@@ -3010,7 +3493,24 @@ async fn download_file_inner(
             .await;
             return;
         }
-        match finalize_file(&destination, &path).await {
+        let policy = match download_file_exists_policy(&manager, &id) {
+            Ok(policy) => policy,
+            Err(error) => {
+                finish_failed!(
+                    &app,
+                    &manager,
+                    &id,
+                    &filename,
+                    &path,
+                    downloaded_bytes,
+                    total_bytes,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+        match finalize_file_with_policy(&destination, &path, policy).await {
             Ok(()) => {
                 publish_update!(
                     &app,
@@ -3130,14 +3630,17 @@ async fn start_download(
 ) -> Result<StartedDownload, String> {
     let parsed_url = parse_http_download_url(&url)?;
 
-    let destination = resolve_destination(Path::new(&destination_path))?;
-    let filename = destination
+    let mut destination = resolve_destination(Path::new(&destination_path))?;
+    let mut filename = destination
         .file_name()
         .and_then(|part| part.to_str())
         .ok_or_else(|| "The selected download filename is invalid.".to_string())?
         .to_string();
+    if destination.exists() && !destination.is_file() {
+        return Err("The selected destination exists but is not a regular file.".to_string());
+    }
+    let file_exists_policy = manager.admission.file_exists_policy()?;
     let id = Uuid::new_v4().to_string();
-    let path = partial_path_for(&destination, &id);
 
     let (sender, receiver) = watch::channel(Control::Running);
     {
@@ -3148,18 +3651,67 @@ async fn start_download(
         if let Some(duplicate) = duplicate_download(&parsed_url, &entries) {
             return Ok(duplicate);
         }
-        ensure_destination_available(&destination, &entries)?;
+        match file_exists_policy {
+            FileExistsPolicy::Rename
+                if destination.exists()
+                    || entries.values().any(|entry| {
+                        !matches!(entry.status.as_str(), "failed" | "cancelled")
+                            && destinations_equal(&entry.destination, &destination)
+                    }) =>
+            {
+                let directory = destination
+                    .parent()
+                    .ok_or_else(|| "The selected download folder is invalid.".to_string())?;
+                destination = suggested_destination(directory, &filename, &entries)?;
+                filename = destination
+                    .file_name()
+                    .and_then(|part| part.to_str())
+                    .ok_or_else(|| "The selected download filename is invalid.".to_string())?
+                    .to_string();
+            }
+            FileExistsPolicy::Overwrite => {
+                ensure_destination_not_reserved(&destination, &entries)?;
+            }
+            FileExistsPolicy::Skip if destination.exists() => {
+                return Ok(StartedDownload {
+                    id: String::new(),
+                    filename,
+                    duplicate: false,
+                    skipped: true,
+                });
+            }
+            FileExistsPolicy::Skip | FileExistsPolicy::Rename => {
+                ensure_destination_available(&destination, &entries)?;
+            }
+        }
+        let path = partial_path_for(&destination, &id);
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|error| format!("Could not create the partial download: {error}"))?;
+        if file_exists_policy == FileExistsPolicy::Overwrite
+            && let Err(error) = clear_stale_segment_sidecar(&destination)
+        {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; could not remove the unused partial file at {}: {cleanup_error}",
+                    path.display()
+                )),
+            };
+        }
         entries.insert(
             id.clone(),
             DownloadEntry {
                 url: parsed_url.to_string(),
                 filename: filename.clone(),
                 destination: destination.clone(),
+                auto_filename: filename_is_url_suggestion(
+                    &filename,
+                    &filename_from_url(&parsed_url),
+                ),
+                file_exists_policy,
                 status: "queued".to_string(),
                 downloaded_bytes: 0,
                 total_bytes: None,
@@ -3172,6 +3724,7 @@ async fn start_download(
             },
         );
     }
+    let path = partial_path_for(&destination, &id);
     publish_update!(&app, &manager, &id, &filename, "queued", 0, None, None);
 
     let app_handle = app.clone();
@@ -3191,6 +3744,7 @@ async fn start_download(
         id,
         filename,
         duplicate: false,
+        skipped: false,
     })
 }
 
@@ -3622,6 +4176,7 @@ fn open_download_location(manager: State<'_, DownloadManager>, id: String) -> Re
 fn get_download_settings(manager: State<'_, DownloadManager>) -> Result<DownloadSettings, String> {
     Ok(DownloadSettings {
         max_concurrent_downloads: manager.admission.limit()?,
+        file_exists_policy: manager.admission.file_exists_policy()?,
     })
 }
 
@@ -3635,12 +4190,34 @@ fn set_max_concurrent_downloads(
         .settings_lock
         .lock()
         .map_err(|_| "Download settings are unavailable.".to_string())?;
+    let file_exists_policy = manager.admission.file_exists_policy()?;
     if let Some(path) = manager.settings_file.as_deref() {
-        persist_max_concurrent_downloads(path, limit)?;
+        persist_download_settings(path, limit, file_exists_policy)?;
     }
     manager.admission.set_limit(limit)?;
     Ok(DownloadSettings {
         max_concurrent_downloads: limit,
+        file_exists_policy,
+    })
+}
+
+#[tauri::command]
+fn set_file_exists_policy(
+    manager: State<'_, DownloadManager>,
+    policy: FileExistsPolicy,
+) -> Result<DownloadSettings, String> {
+    let _settings_guard = manager
+        .settings_lock
+        .lock()
+        .map_err(|_| "Download settings are unavailable.".to_string())?;
+    let limit = manager.admission.limit()?;
+    if let Some(path) = manager.settings_file.as_deref() {
+        persist_download_settings(path, limit, policy)?;
+    }
+    manager.admission.set_file_exists_policy(policy)?;
+    Ok(DownloadSettings {
+        max_concurrent_downloads: limit,
+        file_exists_policy: policy,
     })
 }
 
@@ -3648,19 +4225,22 @@ fn set_max_concurrent_downloads(
 mod tests {
     use super::{
         Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadFailure,
-        DownloadManager, DownloadUpdate, PersistedDownload, PersistedSettings, RetryContext,
-        RetryResult, SEGMENT_RESUME_VERSION, SegmentPosition, SegmentResumeState, SlotResult,
-        UpdateSink, acquire_download_slot, download_file_inner, duplicate_download,
-        enough_disk_space, ensure_destination_available, ensure_disk_space, filename_from_url,
-        finalize_file, finish_failed, is_reserved_windows_name, numbered_filename,
+        DownloadManager, DownloadUpdate, FileExistsPolicy, MAX_FILENAME_UTF16_UNITS,
+        PersistedDownload, PersistedSettings, RetryContext, RetryResult, SEGMENT_RESUME_VERSION,
+        SegmentPosition, SegmentResumeState, SlotResult, UpdateSink, acquire_download_slot,
+        apply_response_filename, clear_stale_segment_sidecar, download_file_inner,
+        duplicate_download, enough_disk_space, ensure_destination_available, ensure_disk_space,
+        filename_from_content_disposition, filename_from_url, finalize_file,
+        finalize_file_with_policy, finish_failed, is_reserved_windows_name, numbered_filename,
         parse_content_range, parse_http_download_url, partial_path_for, pause_active_downloads,
-        persist_max_concurrent_downloads, persist_segment_resume_state, persist_snapshot,
-        prepare_download_retry, prepare_download_url_update, read_max_concurrent_downloads,
-        read_persisted_queue, read_segment_resume_state, reconcile_persisted_status,
-        restore_download_manager, segment_progress, segment_ranges, segment_sidecar_path,
-        valid_range_probe, valid_segment_response, valid_segment_resume_state,
-        validate_max_concurrent_downloads, validate_transition, validators_compatible,
-        wait_before_retry,
+        persist_download_settings, persist_max_concurrent_downloads, persist_segment_resume_state,
+        persist_snapshot, prepare_download_retry, prepare_download_url_update,
+        read_download_settings, read_max_concurrent_downloads, read_persisted_queue,
+        read_segment_resume_state, reconcile_persisted_status, restore_download_manager,
+        sanitize_filename, segment_progress, segment_ranges, segment_sidecar_path,
+        suggested_destination, valid_range_probe, valid_segment_response,
+        valid_segment_resume_state, validate_max_concurrent_downloads, validate_transition,
+        validators_compatible, wait_before_retry,
     };
     use std::{
         io::{Read, Write},
@@ -3696,6 +4276,7 @@ mod tests {
         SlowStreamingRanges,
         StallsSegmentBodies,
         StallsSequentialBody,
+        FilenameHeader,
     }
 
     struct LocalHttpServer {
@@ -3904,6 +4485,11 @@ mod tests {
         if behavior == ServerBehavior::HtmlErrorPage {
             headers.push_str("Content-Type: text/html\r\n");
         }
+        if behavior == ServerBehavior::FilenameHeader {
+            headers.push_str(
+                "Content-Disposition: attachment; filename*=UTF-8''..%2Freport%20archive.bin\r\n",
+            );
+        }
         if let Some(content_range) = content_range {
             headers.push_str(&format!("Content-Range: {content_range}\r\n"));
         }
@@ -3986,6 +4572,8 @@ mod tests {
                     url: String::new(),
                     filename: "payload.bin".to_string(),
                     destination: final_path.clone(),
+                    auto_filename: false,
+                    file_exists_policy: FileExistsPolicy::Rename,
                     status: "queued".to_string(),
                     downloaded_bytes: 0,
                     total_bytes: None,
@@ -4130,15 +4718,107 @@ mod tests {
     }
 
     #[test]
+    fn url_filenames_are_sanitized_and_limited_to_a_safe_component_length() {
+        let url = reqwest::Url::parse(
+            "https://example.com/%2e%2e%2fNUL.%20/%F0%9F%92%BE%F0%9F%92%BE.txt",
+        )
+        .unwrap();
+        let filename = filename_from_url(&url);
+        assert_eq!(filename, "💾💾.txt");
+        assert!(filename.encode_utf16().count() <= MAX_FILENAME_UTF16_UNITS);
+        assert_eq!(sanitize_filename("report... "), "report_");
+        assert_eq!(sanitize_filename("folder\\..\\CON.txt"), "folder___CON.txt");
+
+        let long_name = format!("{}.archive", "x".repeat(300));
+        let shortened = sanitize_filename(&long_name);
+        assert!(shortened.encode_utf16().count() <= MAX_FILENAME_UTF16_UNITS);
+        assert!(shortened.ends_with(".archive"));
+    }
+
+    #[test]
+    fn content_disposition_filenames_are_decoded_and_sanitized() {
+        assert_eq!(
+            filename_from_content_disposition(
+                "attachment; filename=\"fallback.txt\"; filename*=UTF-8''..%2F..%5CNUL.txt"
+            )
+            .as_deref(),
+            Some("_NUL.txt")
+        );
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\"bad;name?.txt\"").as_deref(),
+            Some("bad;name_.txt")
+        );
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename*=UTF-8'en'foo%252Fbar.txt")
+                .as_deref(),
+            Some("foo%2Fbar.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_filename_uses_a_unique_safe_destination_and_moves_resume_state() {
+        let test_download = TestDownload::new();
+        let old_sidecar = segment_sidecar_path(&test_download.final_path);
+        std::fs::write(&old_sidecar, b"checkpoint").unwrap();
+        let existing = test_download.directory.join("_NUL.txt");
+        std::fs::write(&existing, b"keep").unwrap();
+        test_download
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&test_download.id)
+            .unwrap()
+            .auto_filename = true;
+
+        let (destination, filename) =
+            apply_response_filename(&test_download.manager, &test_download.id, "_NUL.txt")
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(filename, "_NUL (1).txt");
+        assert_eq!(destination, test_download.directory.join(&filename));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        assert!(!old_sidecar.exists());
+        assert_eq!(
+            std::fs::read(segment_sidecar_path(&destination)).unwrap(),
+            b"checkpoint"
+        );
+        let entries = test_download.manager.entries.lock().unwrap();
+        assert_eq!(entries[&test_download.id].filename, filename);
+        assert!(!entries[&test_download.id].auto_filename);
+    }
+
+    #[test]
     fn windows_device_names_are_prefixed() {
         let url = reqwest::Url::parse("https://example.com/CON.txt").unwrap();
         assert_eq!(filename_from_url(&url), "_CON.txt");
         assert!(is_reserved_windows_name("LPT1"));
+        assert_eq!(sanitize_filename("COM¹.txt"), "_COM¹.txt");
     }
 
     #[test]
     fn duplicate_names_keep_the_extension() {
         assert_eq!(numbered_filename("archive.tar.gz", 2), "archive.tar (2).gz");
+    }
+
+    #[test]
+    fn suggested_destination_skips_stale_segment_sidecars() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-suggestion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("archive.zip");
+        std::fs::write(segment_sidecar_path(&destination), b"stale checkpoint").unwrap();
+
+        let suggested =
+            suggested_destination(&directory, "archive.zip", &std::collections::HashMap::new())
+                .unwrap();
+        assert_eq!(suggested, directory.join("archive (1).zip"));
+
+        clear_stale_segment_sidecar(&destination).unwrap();
+        assert!(!segment_sidecar_path(&destination).exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4525,6 +5205,8 @@ mod tests {
             url: "https://example.com/archive.zip".to_string(),
             filename: "archive.zip".to_string(),
             destination: None,
+            auto_filename: false,
+            file_exists_policy: FileExistsPolicy::Rename,
             status: status.to_string(),
             downloaded_bytes,
             total_bytes: Some(12),
@@ -4594,6 +5276,8 @@ mod tests {
                 url: String::new(),
                 filename: "archive.zip".to_string(),
                 destination: destination.clone(),
+                auto_filename: false,
+                file_exists_policy: FileExistsPolicy::Rename,
                 status: "queued".to_string(),
                 downloaded_bytes: 0,
                 total_bytes: None,
@@ -4625,6 +5309,70 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
         assert_eq!(std::fs::read(&partial).unwrap(), b"new data");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overwrite_policy_replaces_only_after_download_is_ready() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-overwrite-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("archive.zip");
+        let partial = directory.join(".partial");
+        std::fs::write(&destination, b"existing").unwrap();
+        std::fs::write(&partial, b"new data").unwrap();
+
+        finalize_file_with_policy(&destination, &partial, FileExistsPolicy::Overwrite)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new data");
+        assert!(!partial.exists());
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "successful replacement should clean up its backup"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn skip_policy_preserves_existing_file_and_partial() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-skip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("archive.zip");
+        let partial = directory.join(".partial");
+        std::fs::write(&destination, b"existing").unwrap();
+        std::fs::write(&partial, b"new data").unwrap();
+
+        assert!(
+            finalize_file_with_policy(&destination, &partial, FileExistsPolicy::Skip)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"new data");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_exists_policy_and_concurrency_persist_together() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let settings_path = directory.join("settings.json");
+
+        persist_download_settings(&settings_path, 5, FileExistsPolicy::Overwrite).unwrap();
+        let settings = read_download_settings(&settings_path).unwrap();
+        assert_eq!(settings.max_concurrent_downloads, 5);
+        assert_eq!(settings.file_exists_policy, FileExistsPolicy::Overwrite);
+
+        persist_max_concurrent_downloads(&settings_path, 2).unwrap();
+        let settings = read_download_settings(&settings_path).unwrap();
+        assert_eq!(settings.max_concurrent_downloads, 2);
+        assert_eq!(settings.file_exists_policy, FileExistsPolicy::Overwrite);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4715,6 +5463,7 @@ mod tests {
             serde_json::to_vec(&PersistedSettings {
                 version: super::PERSISTED_FORMAT_VERSION,
                 max_concurrent_downloads: 5,
+                file_exists_policy: FileExistsPolicy::Rename,
             })
             .unwrap(),
         )
@@ -4896,6 +5645,30 @@ mod tests {
             server.identity_range_requests.load(Ordering::Acquire),
             server.range_requests.load(Ordering::Acquire)
         );
+    }
+
+    #[tokio::test]
+    async fn local_http_content_disposition_sets_a_safe_auto_filename() {
+        let _guard = http_test_guard();
+        let payload = test_payload(128 * 1024);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::FilenameHeader);
+        let test_download = TestDownload::new();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = server.url.clone();
+            entry.auto_filename = true;
+        }
+
+        start_test_download(&server, &test_download).await.unwrap();
+
+        let expected_path = test_download.directory.join("report archive.bin");
+        assert_eq!(test_download.status(), "completed");
+        assert_eq!(std::fs::read(&expected_path).unwrap(), payload);
+        let entries = test_download.manager.entries.lock().unwrap();
+        assert_eq!(entries[&test_download.id].filename, "report archive.bin");
+        assert_eq!(entries[&test_download.id].destination, expected_path);
+        assert!(!entries[&test_download.id].auto_filename);
     }
 
     #[tokio::test]
@@ -5538,7 +6311,8 @@ pub fn run() {
             open_download_location,
             list_downloads,
             get_download_settings,
-            set_max_concurrent_downloads
+            set_max_concurrent_downloads,
+            set_file_exists_policy
         ])
         .plugin(tauri_plugin_dialog::init())
         .build(tauri::generate_context!())

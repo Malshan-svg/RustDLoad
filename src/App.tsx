@@ -37,8 +37,9 @@ type Download = {
 };
 
 type DownloadUpdate = Omit<Download, "url">;
-type StartedDownload = Pick<Download, "id" | "filename"> & { duplicate: boolean };
-type DownloadSettings = { maxConcurrentDownloads: number };
+type StartedDownload = Pick<Download, "id" | "filename"> & { duplicate: boolean; skipped: boolean };
+type FileExistsPolicy = "rename" | "overwrite" | "skip";
+type DownloadSettings = { maxConcurrentDownloads: number; fileExistsPolicy: FileExistsPolicy };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
 
@@ -178,8 +179,11 @@ function App() {
   const [page, setPage] = useState<AppPage>("downloads");
   const [maxConcurrentDownloads, setMaxConcurrentDownloads] = useState(3);
   const [concurrencyDraft, setConcurrencyDraft] = useState("3");
+  const [fileExistsPolicy, setFileExistsPolicy] = useState<FileExistsPolicy>("rename");
   const [settingsError, setSettingsError] = useState("");
+  const [filePolicyError, setFilePolicyError] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isSavingFilePolicy, setIsSavingFilePolicy] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ downloadId: string; x: number; y: number } | null>(null);
   const [noticeMessage, setNoticeMessage] = useState("");
   const urlInputRef = useRef<HTMLInputElement>(null);
@@ -228,6 +232,7 @@ function App() {
         if (!disposed) {
           setMaxConcurrentDownloads(settings.maxConcurrentDownloads);
           setConcurrencyDraft(String(settings.maxConcurrentDownloads));
+          setFileExistsPolicy(settings.fileExistsPolicy);
         }
       } catch (error) {
         setErrorMessage(`Could not initialize downloads: ${String(error)}`);
@@ -346,6 +351,11 @@ function App() {
       if (started.duplicate) {
         setDownloads(await invoke<Download[]>("list_downloads"));
         setNoticeMessage(`${started.filename} is already in your download list.`);
+        if (clearInput) setUrl("");
+        return;
+      }
+      if (started.skipped) {
+        setNoticeMessage(`${started.filename} already exists; the download was skipped.`);
         if (clearInput) setUrl("");
         return;
       }
@@ -473,10 +483,27 @@ function App() {
       const saved = await invoke<DownloadSettings>("set_max_concurrent_downloads", { limit });
       setMaxConcurrentDownloads(saved.maxConcurrentDownloads);
       setConcurrencyDraft(String(saved.maxConcurrentDownloads));
+      setFileExistsPolicy(saved.fileExistsPolicy);
     } catch (error) {
       setSettingsError(String(error));
     } finally {
       setIsSavingSettings(false);
+    }
+  }
+
+  async function saveFileExistsPolicy(policy: FileExistsPolicy) {
+    setFilePolicyError("");
+    setIsSavingFilePolicy(true);
+    try {
+      const saved = await invoke<DownloadSettings>("set_file_exists_policy", { policy });
+      setMaxConcurrentDownloads(saved.maxConcurrentDownloads);
+      setConcurrencyDraft(String(saved.maxConcurrentDownloads));
+      setFileExistsPolicy(saved.fileExistsPolicy);
+    } catch (error) {
+      setFileExistsPolicy(fileExistsPolicy);
+      setFilePolicyError(String(error));
+    } finally {
+      setIsSavingFilePolicy(false);
     }
   }
 
@@ -582,6 +609,32 @@ function App() {
                   {isSavingSettings ? "Saving…" : "Save settings"}
                 </button>
               </form>
+              <section className="settings-card file-policy-card">
+                <div className="settings-copy">
+                  <h2>When a file already exists</h2>
+                  <p>Choose how RustDLoad handles a destination name that is already in use.</p>
+                </div>
+                <label className="settings-field" htmlFor="file-exists-policy">
+                  <span>File exists behavior</span>
+                  <select
+                    disabled={isSavingFilePolicy}
+                    id="file-exists-policy"
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      if (value !== "rename" && value !== "overwrite" && value !== "skip") return;
+                      const policy = value;
+                      setFileExistsPolicy(policy);
+                      void saveFileExistsPolicy(policy);
+                    }}
+                    value={fileExistsPolicy}
+                  >
+                    <option value="rename">Keep both (rename new file)</option>
+                    <option value="overwrite">Replace existing file</option>
+                    <option value="skip">Skip the new download</option>
+                  </select>
+                </label>
+                {filePolicyError && <p className="settings-error" role="alert">{filePolicyError}</p>}
+              </section>
             </>
           ) : (
             <>
