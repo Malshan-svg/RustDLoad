@@ -37,7 +37,7 @@ type Download = {
 };
 
 type DownloadUpdate = Omit<Download, "url">;
-type StartedDownload = Pick<Download, "id" | "filename">;
+type StartedDownload = Pick<Download, "id" | "filename"> & { duplicate: boolean };
 type DownloadSettings = { maxConcurrentDownloads: number };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
@@ -50,6 +50,16 @@ const filters: { id: DownloadFilter; label: string; icon: IconName }[] = [
 ];
 
 const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "link-expired", "failed", "completed", "cancelled"];
+
+function normalizedUrlForDuplicateCheck(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return value.trim();
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -315,12 +325,31 @@ function App() {
 
   async function enqueueDownload(submittedUrl: string, clearInput = false) {
     setErrorMessage("");
+    setNoticeMessage("");
     if (clearInput) setIsStarting(true);
     try {
+      const normalizedUrl = normalizedUrlForDuplicateCheck(submittedUrl);
+      const duplicate = downloads.find(
+        (download) =>
+          download.url &&
+          normalizedUrlForDuplicateCheck(download.url) === normalizedUrl,
+      );
+      if (duplicate) {
+        setNoticeMessage(`${duplicate.filename} is already in your download list.`);
+        if (clearInput) setUrl("");
+        return;
+      }
       const defaultPath = await invoke<string>("suggest_download_destination", { url: submittedUrl });
       const destinationPath = await save({ defaultPath, title: "Save download as" });
       if (destinationPath === null) return;
       const started = await invoke<StartedDownload>("start_download", { url: submittedUrl, destinationPath });
+      if (started.duplicate) {
+        setDownloads(await invoke<Download[]>("list_downloads"));
+        setNoticeMessage(`${started.filename} is already in your download list.`);
+        if (clearInput) setUrl("");
+        return;
+      }
+      const newDownload = { id: started.id, filename: started.filename };
       setDownloads((current) => {
         const existing = current.some((download) => download.id === started.id);
         if (existing) {
@@ -330,7 +359,7 @@ function App() {
         }
         return [
           {
-            ...started,
+            ...newDownload,
             url: submittedUrl,
             downloadedBytes: 0,
             totalBytes: null,

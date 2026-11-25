@@ -151,6 +151,7 @@ struct DownloadSnapshot {
 struct StartedDownload {
     id: String,
     filename: String,
+    duplicate: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -955,6 +956,31 @@ fn filename_from_url(url: &reqwest::Url) -> String {
     } else {
         safe.to_string()
     }
+}
+
+fn parse_http_download_url(value: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(value).map_err(|error| error.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only HTTP and HTTPS download links are supported.".to_string());
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn duplicate_download(
+    url: &reqwest::Url,
+    entries: &HashMap<String, DownloadEntry>,
+) -> Option<StartedDownload> {
+    let target_url = url.as_str();
+    entries.iter().find_map(|(id, entry)| {
+        let mut existing_url = reqwest::Url::parse(&entry.url).ok()?;
+        existing_url.set_fragment(None);
+        (existing_url.as_str() == target_url).then(|| StartedDownload {
+            id: id.clone(),
+            filename: entry.filename.clone(),
+            duplicate: true,
+        })
+    })
 }
 
 fn resolve_destination(destination: &Path) -> Result<PathBuf, String> {
@@ -3080,10 +3106,7 @@ fn suggest_download_destination(
     manager: State<'_, DownloadManager>,
     url: String,
 ) -> Result<String, String> {
-    let parsed_url = reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS download links are supported.".to_string());
-    }
+    let parsed_url = parse_http_download_url(&url)?;
     let download_dir = app
         .path()
         .download_dir()
@@ -3105,10 +3128,7 @@ async fn start_download(
     url: String,
     destination_path: String,
 ) -> Result<StartedDownload, String> {
-    let parsed_url = reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS download links are supported.".to_string());
-    }
+    let parsed_url = parse_http_download_url(&url)?;
 
     let destination = resolve_destination(Path::new(&destination_path))?;
     let filename = destination
@@ -3125,6 +3145,9 @@ async fn start_download(
             .entries
             .lock()
             .map_err(|_| "Download state is unavailable.".to_string())?;
+        if let Some(duplicate) = duplicate_download(&parsed_url, &entries) {
+            return Ok(duplicate);
+        }
         ensure_destination_available(&destination, &entries)?;
         std::fs::OpenOptions::new()
             .write(true)
@@ -3164,7 +3187,11 @@ async fn start_download(
         download_file(app_handle, task_manager, download, receiver).await;
     });
 
-    Ok(StartedDownload { id, filename })
+    Ok(StartedDownload {
+        id,
+        filename,
+        duplicate: false,
+    })
 }
 
 #[tauri::command]
@@ -3298,10 +3325,7 @@ async fn prepare_download_url_update(
     id: &str,
     new_url: &str,
 ) -> Result<DownloadContext, String> {
-    let parsed_url = reqwest::Url::parse(new_url).map_err(|error| error.to_string())?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS download links are supported.".to_string());
-    }
+    let parsed_url = parse_http_download_url(new_url)?;
     let (filename, destination, old_total, old_validator) = {
         let entries = manager
             .entries
@@ -3626,16 +3650,17 @@ mod tests {
         Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadFailure,
         DownloadManager, DownloadUpdate, PersistedDownload, PersistedSettings, RetryContext,
         RetryResult, SEGMENT_RESUME_VERSION, SegmentPosition, SegmentResumeState, SlotResult,
-        UpdateSink, acquire_download_slot, download_file_inner, enough_disk_space,
-        ensure_destination_available, ensure_disk_space, filename_from_url, finalize_file,
-        finish_failed, is_reserved_windows_name, numbered_filename, parse_content_range,
-        partial_path_for, pause_active_downloads, persist_max_concurrent_downloads,
-        persist_segment_resume_state, persist_snapshot, prepare_download_retry,
-        prepare_download_url_update, read_max_concurrent_downloads, read_persisted_queue,
-        read_segment_resume_state, reconcile_persisted_status, restore_download_manager,
-        segment_progress, segment_ranges, segment_sidecar_path, valid_range_probe,
-        valid_segment_response, valid_segment_resume_state, validate_max_concurrent_downloads,
-        validate_transition, validators_compatible, wait_before_retry,
+        UpdateSink, acquire_download_slot, download_file_inner, duplicate_download,
+        enough_disk_space, ensure_destination_available, ensure_disk_space, filename_from_url,
+        finalize_file, finish_failed, is_reserved_windows_name, numbered_filename,
+        parse_content_range, parse_http_download_url, partial_path_for, pause_active_downloads,
+        persist_max_concurrent_downloads, persist_segment_resume_state, persist_snapshot,
+        prepare_download_retry, prepare_download_url_update, read_max_concurrent_downloads,
+        read_persisted_queue, read_segment_resume_state, reconcile_persisted_status,
+        restore_download_manager, segment_progress, segment_ranges, segment_sidecar_path,
+        valid_range_probe, valid_segment_response, valid_segment_resume_state,
+        validate_max_concurrent_downloads, validate_transition, validators_compatible,
+        wait_before_retry,
     };
     use std::{
         io::{Read, Write},
@@ -4114,6 +4139,29 @@ mod tests {
     #[test]
     fn duplicate_names_keep_the_extension() {
         assert_eq!(numbered_filename("archive.tar.gz", 2), "archive.tar (2).gz");
+    }
+
+    #[test]
+    fn duplicate_download_urls_ignore_fragments_and_return_existing_entry() {
+        let test_download = TestDownload::new();
+        let original_url = "https://example.com/archive.zip#first";
+        test_download
+            .manager
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&test_download.id)
+            .unwrap()
+            .url = original_url.to_string();
+        let parsed = parse_http_download_url("https://example.com/archive.zip#second").unwrap();
+
+        let duplicate =
+            duplicate_download(&parsed, &test_download.manager.entries.lock().unwrap()).unwrap();
+
+        assert_eq!(parsed.as_str(), "https://example.com/archive.zip");
+        assert_eq!(duplicate.id, test_download.id);
+        assert_eq!(duplicate.filename, "payload.bin");
+        assert!(duplicate.duplicate);
     }
 
     #[test]
@@ -4720,6 +4768,7 @@ mod tests {
         let (manager, recovered) =
             restore_download_manager(persistence_file, &download_dir).unwrap();
         assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].filename, "custom-name.bin");
         assert_eq!(
             recovered[0].destination.as_deref(),
             Some(destination.to_str().unwrap())
