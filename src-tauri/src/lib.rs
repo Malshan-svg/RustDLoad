@@ -1,6 +1,8 @@
 use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+use std::process::Command;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -11,7 +13,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Notify, watch},
 };
 use uuid::Uuid;
@@ -31,6 +33,26 @@ struct DownloadUpdate {
     total_bytes: Option<u64>,
     status: String,
     error: Option<String>,
+}
+
+fn remember_validator(manager: &DownloadManager, id: &str, validator: Option<String>) {
+    let updated = manager
+        .entries
+        .lock()
+        .map(|mut entries| {
+            if let Some(entry) = entries.get_mut(id) {
+                entry.validator = validator;
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if updated {
+        if let Err(error) = manager.persist() {
+            eprintln!("{error}");
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -62,11 +84,14 @@ enum Control {
 struct DownloadEntry {
     url: String,
     filename: String,
+    destination: PathBuf,
     status: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
+    validator: Option<String>,
     error: Option<String>,
     control: watch::Sender<Control>,
+    task_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -133,9 +158,13 @@ struct PersistedDownload {
     id: String,
     url: String,
     filename: String,
+    #[serde(default)]
+    destination: Option<String>,
     status: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
+    #[serde(default)]
+    validator: Option<String>,
     error: Option<String>,
 }
 
@@ -232,9 +261,11 @@ impl DownloadManager {
                     id: id.clone(),
                     url: entry.url.clone(),
                     filename: entry.filename.clone(),
+                    destination: Some(entry.destination.to_string_lossy().into_owned()),
                     status: entry.status.clone(),
                     downloaded_bytes: entry.downloaded_bytes,
                     total_bytes: entry.total_bytes,
+                    validator: entry.validator.clone(),
                     error: entry.error.clone(),
                 })
                 .collect()
@@ -365,7 +396,24 @@ fn restore_download_manager(
             record.error = Some("The saved download URL is invalid.".to_string());
         }
 
-        let partial_path = download_dir.join(format!(".{}.part", record.id));
+        let destination = record
+            .destination
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| download_dir.join(&record.filename));
+        let Some(destination_filename) = destination.file_name().and_then(|part| part.to_str())
+        else {
+            eprintln!("Ignoring a download record with an invalid destination.");
+            continue;
+        };
+        if destination_filename != record.filename || destination.parent().is_none() {
+            eprintln!("Ignoring a download record with a mismatched destination.");
+            continue;
+        }
+        record.destination = Some(destination.to_string_lossy().into_owned());
+        let destination_directory = destination.parent().unwrap();
+        remove_stale_segment_directory(destination_directory, &record.id);
+        let partial_path = partial_path_for(&destination, &record.id);
         let partial_size = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
         {
             match std::fs::metadata(&partial_path) {
@@ -376,10 +424,21 @@ fn restore_download_manager(
                     None
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    std::fs::File::create(&partial_path).map_err(|error| {
-                        format!("Could not restore partial download {}: {error}", record.id)
-                    })?;
-                    Some(0)
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open(&partial_path)
+                    {
+                        Ok(_) => Some(0),
+                        Err(error) => {
+                            record.status = "failed".to_string();
+                            record.error = Some(format!(
+                                "Could not restore partial download {}: {error}",
+                                record.id
+                            ));
+                            None
+                        }
+                    }
                 }
                 Err(error) => {
                     record.status = "failed".to_string();
@@ -391,7 +450,7 @@ fn restore_download_manager(
             None
         };
         let completed_size = if record.status == "completed" {
-            std::fs::metadata(download_dir.join(&record.filename))
+            std::fs::metadata(&destination)
                 .ok()
                 .filter(|metadata| metadata.is_file())
                 .map(|metadata| metadata.len())
@@ -416,11 +475,14 @@ fn restore_download_manager(
                 DownloadEntry {
                     url: record.url.clone(),
                     filename: record.filename.clone(),
+                    destination,
                     status: record.status.clone(),
                     downloaded_bytes: record.downloaded_bytes,
                     total_bytes: record.total_bytes,
+                    validator: record.validator.clone(),
                     error: record.error.clone(),
                     control: sender,
+                    task_lock: Arc::new(tokio::sync::Mutex::new(())),
                 },
             );
         drop(receiver);
@@ -450,13 +512,25 @@ fn remove_stale_segment_directories(download_dir: &Path) {
             continue;
         };
         if Uuid::parse_str(id).is_ok() {
-            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-                if let Err(error) = std::fs::remove_dir_all(entry.path()) {
-                    eprintln!("Could not remove stale segments for download {id}: {error}");
-                }
-            }
+            remove_stale_segment_directory(download_dir, id);
         }
     }
+}
+
+fn remove_stale_segment_directory(directory: &Path, id: &str) {
+    let path = directory.join(format!(".{id}.segments"));
+    if path.is_dir() {
+        if let Err(error) = std::fs::remove_dir_all(path) {
+            eprintln!("Could not remove stale segments for download {id}: {error}");
+        }
+    }
+}
+
+fn partial_path_for(destination: &Path, id: &str) -> PathBuf {
+    destination
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{id}.part"))
 }
 
 fn read_persisted_queue(
@@ -593,6 +667,77 @@ fn filename_from_url(url: &reqwest::Url) -> String {
     }
 }
 
+fn resolve_destination(destination: &Path) -> Result<PathBuf, String> {
+    let filename = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "Choose a file name for the download.".to_string())?;
+    if !matches!(
+        Path::new(filename)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Component::Normal(_)]
+    ) {
+        return Err("The selected download destination is invalid.".to_string());
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "The selected download destination is invalid.".to_string())?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("Could not access the selected folder: {error}"))?;
+    if !parent.is_dir() {
+        return Err("The selected download folder is not a directory.".to_string());
+    }
+    Ok(parent.join(filename))
+}
+
+fn destinations_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn ensure_destination_available(
+    destination: &Path,
+    entries: &HashMap<String, DownloadEntry>,
+) -> Result<(), String> {
+    if destination.exists() {
+        return Err("A file already exists at the selected destination.".to_string());
+    }
+    if entries.values().any(|entry| {
+        !matches!(entry.status.as_str(), "failed" | "cancelled")
+            && destinations_equal(&entry.destination, destination)
+    }) {
+        return Err("Another download is already using the selected destination.".to_string());
+    }
+    Ok(())
+}
+
+fn suggested_destination(
+    directory: &Path,
+    proposed_filename: &str,
+    entries: &HashMap<String, DownloadEntry>,
+) -> Result<PathBuf, String> {
+    (0..10_000)
+        .map(|number| directory.join(numbered_filename(proposed_filename, number)))
+        .find(|candidate| {
+            !candidate.exists()
+                && !entries.values().any(|entry| {
+                    !matches!(entry.status.as_str(), "failed" | "cancelled")
+                        && destinations_equal(&entry.destination, candidate)
+                })
+        })
+        .ok_or_else(|| "Could not choose a unique download filename.".to_string())
+}
+
 fn is_reserved_windows_name(filename: &str) -> bool {
     let stem = Path::new(filename)
         .file_stem()
@@ -698,8 +843,8 @@ fn valid_range_probe(
 
 fn validators_compatible(expected: Option<&str>, actual: Option<&str>) -> bool {
     match (expected, actual) {
-        (Some(expected), Some(actual)) => expected == actual,
-        _ => true,
+        (Some(expected), actual) => actual == Some(expected),
+        (None, _) => true,
     }
 }
 
@@ -836,39 +981,47 @@ async fn acquire_download_slot(
     }
 }
 
-async fn finalize_file(
-    directory: &Path,
-    initial_filename: &str,
-    partial_path: &Path,
-) -> Result<String, String> {
-    for number in 0..10_000 {
-        let filename = numbered_filename(initial_filename, number);
-        let destination = directory.join(&filename);
-        match tokio::fs::hard_link(partial_path, &destination).await {
-            Ok(()) => {
-                tokio::fs::remove_file(partial_path)
-                    .await
-                    .map_err(|error| format!("Could not finalize the download: {error}"))?;
-                return Ok(filename);
+async fn finalize_file(destination: &Path, partial_path: &Path) -> Result<(), String> {
+    tokio::fs::hard_link(partial_path, destination)
+        .await
+        .map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                "A file already exists at the selected destination; it was not overwritten."
+                    .to_string()
+            } else {
+                format!("Could not finalize the download: {error}")
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Could not finalize the download: {error}")),
-        }
-    }
-    Err("Could not choose a unique final filename.".to_string())
+        })?;
+    tokio::fs::remove_file(partial_path)
+        .await
+        .map_err(|error| format!("Could not finalize the download: {error}"))
 }
 
 enum SegmentedAttempt {
     Completed(u64),
     Fallback,
-    Paused(u64, u64),
+    Paused(u64, u64, Option<String>),
     Cancelled(u64, u64),
 }
 
 enum SegmentWorkerResult {
-    Completed(usize, u64),
+    Completed(u64),
     Invalid,
     Controlled(Control),
+}
+
+fn contiguous_segment_lengths(expected: &[u64], actual: &[Option<u64>]) -> Vec<u64> {
+    let mut prefix = Vec::new();
+    for (expected, actual) in expected.iter().zip(actual) {
+        let Some(actual) = actual.filter(|actual| *actual > 0 && *actual <= *expected) else {
+            break;
+        };
+        prefix.push(actual);
+        if actual < *expected {
+            break;
+        }
+    }
+    prefix
 }
 
 async fn fetch_segment(
@@ -877,7 +1030,6 @@ async fn fetch_segment(
     manager: DownloadManager,
     url: String,
     path: PathBuf,
-    index: usize,
     filename: String,
     id: String,
     start: u64,
@@ -968,7 +1120,11 @@ async fn fetch_segment(
             },
             changed = control.changed() => {
                 if changed.is_err() || *control.borrow() != Control::Running {
-                    return SegmentWorkerResult::Controlled(*control.borrow());
+                    let state = *control.borrow();
+                    if state == Control::Paused && file.flush().await.is_err() {
+                        return SegmentWorkerResult::Invalid;
+                    }
+                    return SegmentWorkerResult::Controlled(state);
                 }
                 return SegmentWorkerResult::Invalid;
             }
@@ -977,7 +1133,7 @@ async fn fetch_segment(
     if file.flush().await.is_err() || written != end - start + 1 {
         SegmentWorkerResult::Invalid
     } else {
-        SegmentWorkerResult::Completed(index, written)
+        SegmentWorkerResult::Completed(written)
     }
 }
 
@@ -994,7 +1150,7 @@ async fn try_segmented_download(
 ) -> Result<SegmentedAttempt, String> {
     if *control.borrow() != Control::Running {
         return Ok(match *control.borrow() {
-            Control::Paused => SegmentedAttempt::Paused(0, 0),
+            Control::Paused => SegmentedAttempt::Paused(0, 0, None),
             Control::Cancelled => SegmentedAttempt::Cancelled(0, 0),
             Control::Running => unreachable!(),
         });
@@ -1008,7 +1164,7 @@ async fn try_segmented_download(
         result = probe_request.send() => result.map_err(|error| error.to_string())?,
         changed = control.changed() => {
             return Ok(match *control.borrow() {
-                Control::Paused => SegmentedAttempt::Paused(0, 0),
+                Control::Paused => SegmentedAttempt::Paused(0, 0, None),
                 Control::Cancelled => SegmentedAttempt::Cancelled(0, 0),
                 Control::Running => {
                     if changed.is_err() {
@@ -1052,7 +1208,7 @@ async fn try_segmented_download(
             },
             changed = control.changed() => {
                 return Ok(match *control.borrow() {
-                    Control::Paused => SegmentedAttempt::Paused(0, total),
+                    Control::Paused => SegmentedAttempt::Paused(0, total, validator.clone()),
                     Control::Cancelled => SegmentedAttempt::Cancelled(0, total),
                     Control::Running => {
                         if changed.is_err() {
@@ -1068,6 +1224,7 @@ async fn try_segmented_download(
     if valid_range_probe(probe_status, probe_range, probe_body_length) != Some(total) {
         return Ok(SegmentedAttempt::Fallback);
     }
+    remember_validator(manager, id, validator.clone());
 
     let segment_directory = directory.join(format!(".{id}.segments"));
     match tokio::fs::remove_dir_all(&segment_directory).await {
@@ -1100,7 +1257,6 @@ async fn try_segmented_download(
             manager.clone(),
             url.to_string(),
             segment_directory.join(index.to_string()),
-            index,
             filename.to_string(),
             id.to_string(),
             start,
@@ -1114,67 +1270,109 @@ async fn try_segmented_download(
     }
 
     let mut completed_bytes = 0u64;
-    let mut completed_segments = vec![false; ranges.len()];
     let mut attempt = SegmentedAttempt::Completed(total);
     while let Some(result) = workers.join_next().await {
         match result {
-            Ok(SegmentWorkerResult::Completed(index, bytes)) => {
-                completed_segments[index] = true;
+            Ok(SegmentWorkerResult::Completed(bytes)) => {
                 completed_bytes += bytes;
-                publish_update(
-                    app,
-                    manager,
-                    id,
-                    filename,
-                    "downloading",
-                    progress.load(Ordering::Relaxed),
-                    Some(total),
-                    None,
-                );
+                if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
+                    publish_update(
+                        app,
+                        manager,
+                        id,
+                        filename,
+                        "downloading",
+                        progress.load(Ordering::Relaxed),
+                        Some(total),
+                        None,
+                    );
+                }
             }
             Ok(SegmentWorkerResult::Controlled(Control::Paused)) => {
-                attempt = SegmentedAttempt::Paused(completed_bytes, total);
-                break;
+                attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
             }
             Ok(SegmentWorkerResult::Controlled(Control::Cancelled)) => {
                 attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
                 break;
             }
             Ok(SegmentWorkerResult::Controlled(Control::Running))
-            | Ok(SegmentWorkerResult::Invalid) => {
-                attempt = SegmentedAttempt::Fallback;
-                break;
-            }
-            Err(_) => {
-                attempt = SegmentedAttempt::Fallback;
-                break;
-            }
+            | Ok(SegmentWorkerResult::Invalid) => match *control.borrow() {
+                Control::Paused => {
+                    attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
+                }
+                Control::Cancelled => {
+                    attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
+                    break;
+                }
+                Control::Running if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) => {
+                    attempt = SegmentedAttempt::Fallback;
+                    break;
+                }
+                Control::Running => {}
+            },
+            Err(_) => match *control.borrow() {
+                Control::Paused => {
+                    attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
+                }
+                Control::Cancelled => {
+                    attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
+                    break;
+                }
+                Control::Running if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) => {
+                    attempt = SegmentedAttempt::Fallback;
+                    break;
+                }
+                Control::Running => {}
+            },
         }
     }
-    if !matches!(attempt, SegmentedAttempt::Completed(_)) {
+    if matches!(
+        attempt,
+        SegmentedAttempt::Fallback | SegmentedAttempt::Cancelled(_, _)
+    ) {
         workers.abort_all();
     }
     while workers.join_next().await.is_some() {}
+    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
+        let _ = control.borrow_and_update();
+    }
 
     if matches!(attempt, SegmentedAttempt::Completed(_)) && completed_bytes != total {
         attempt = SegmentedAttempt::Fallback;
     }
-    let assembly_count = match &attempt {
-        SegmentedAttempt::Completed(_) => ranges.len(),
-        SegmentedAttempt::Paused(_, _) => completed_segments
+    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) && completed_bytes == total {
+        attempt = SegmentedAttempt::Completed(total);
+    }
+    let assembly_lengths = match &attempt {
+        SegmentedAttempt::Completed(_) => ranges
             .iter()
-            .take_while(|completed| **completed)
-            .count(),
-        _ => 0,
+            .map(|(start, end)| end - start + 1)
+            .collect::<Vec<_>>(),
+        SegmentedAttempt::Paused(_, _, Some(_)) => {
+            let mut actual = Vec::with_capacity(ranges.len());
+            for index in 0..ranges.len() {
+                actual.push(
+                    tokio::fs::metadata(segment_directory.join(index.to_string()))
+                        .await
+                        .ok()
+                        .map(|metadata| metadata.len()),
+                );
+            }
+            let expected: Vec<_> = ranges.iter().map(|(start, end)| end - start + 1).collect();
+            contiguous_segment_lengths(&expected, &actual)
+        }
+        SegmentedAttempt::Paused(_, _, None) => Vec::new(),
+        _ => Vec::new(),
     };
-    if assembly_count > 0 {
+    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) || !assembly_lengths.is_empty() {
         let mut output = tokio::fs::File::create(path)
             .await
             .map_err(|error| format!("Could not assemble the download: {error}"))?;
-        for index in 0..assembly_count {
-            let mut segment = tokio::fs::File::open(segment_directory.join(index.to_string()))
+        for (index, length) in assembly_lengths.iter().copied().enumerate() {
+            let segment = tokio::fs::File::open(segment_directory.join(index.to_string()))
                 .await
                 .map_err(|error| format!("Could not read a download segment: {error}"))?;
+            let mut segment = segment.take(length);
             tokio::select! {
                 result = tokio::io::copy(&mut segment, &mut output) => {
                     result.map_err(|error| format!("Could not assemble the download: {error}"))?;
@@ -1184,7 +1382,7 @@ async fn try_segmented_download(
                     if changed.is_err() || state == Control::Cancelled {
                         attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
                     } else if state == Control::Paused {
-                        attempt = SegmentedAttempt::Paused(completed_bytes, total);
+                        attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
                     } else {
                         attempt = SegmentedAttempt::Fallback;
                     }
@@ -1198,12 +1396,12 @@ async fn try_segmented_download(
             .map_err(|error| format!("Could not assemble the download: {error}"))?;
         drop(output);
     }
-    if matches!(attempt, SegmentedAttempt::Paused(_, _)) {
+    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
         let progress = tokio::fs::metadata(path)
             .await
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        attempt = SegmentedAttempt::Paused(progress, total);
+        attempt = SegmentedAttempt::Paused(progress, total, validator);
     }
     if matches!(attempt, SegmentedAttempt::Fallback) {
         tokio::fs::File::create(path)
@@ -1222,10 +1420,19 @@ async fn download_file<R: Runtime>(
     id: String,
     url: String,
     initial_filename: String,
-    directory: PathBuf,
+    destination: PathBuf,
     path: PathBuf,
     control: watch::Receiver<Control>,
 ) {
+    let task_lock = match manager.entries.lock() {
+        Ok(entries) => entries.get(&id).map(|entry| entry.task_lock.clone()),
+        Err(_) => None,
+    };
+    let Some(task_lock) = task_lock else {
+        eprintln!("Download {id} disappeared before its transfer could start.");
+        return;
+    };
+    let _task_guard = task_lock.lock().await;
     let app: Arc<dyn UpdateSink> = Arc::new(app);
     download_file_inner(
         app,
@@ -1233,7 +1440,7 @@ async fn download_file<R: Runtime>(
         id,
         url,
         initial_filename,
-        directory,
+        destination,
         path,
         control,
     )
@@ -1246,13 +1453,21 @@ async fn download_file_inner(
     id: String,
     url: String,
     initial_filename: String,
-    directory: PathBuf,
+    destination: PathBuf,
     path: PathBuf,
     mut control: watch::Receiver<Control>,
 ) {
     let client = reqwest::Client::new();
-    let mut filename = initial_filename;
-    let mut validator: Option<String> = None;
+    let directory = destination
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let filename = initial_filename;
+    let mut validator = manager
+        .entries
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(&id).and_then(|entry| entry.validator.clone()));
     let mut total_bytes = None;
     let mut last_update = Instant::now();
 
@@ -1344,9 +1559,8 @@ async fn download_file_inner(
             .await
             {
                 Ok(SegmentedAttempt::Completed(total)) => {
-                    match finalize_file(&directory, &filename, &path).await {
-                        Ok(final_filename) => {
-                            filename = final_filename;
+                    match finalize_file(&destination, &path).await {
+                        Ok(()) => {
                             publish_update(
                                 &app,
                                 &manager,
@@ -1375,7 +1589,11 @@ async fn download_file_inner(
                     return;
                 }
                 Ok(SegmentedAttempt::Fallback) => {}
-                Ok(SegmentedAttempt::Paused(progress, total)) => {
+                Ok(SegmentedAttempt::Paused(progress, total, segment_validator)) => {
+                    if segment_validator.is_some() {
+                        validator = segment_validator.clone();
+                        remember_validator(&manager, &id, segment_validator);
+                    }
                     publish_update(
                         &app,
                         &manager,
@@ -1609,6 +1827,7 @@ async fn download_file_inner(
             }
             validator = response_validator(&response);
         }
+        remember_validator(&manager, &id, validator.clone());
 
         let mut file = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -1825,9 +2044,8 @@ async fn download_file_inner(
             .await;
             return;
         }
-        match finalize_file(&directory, &filename, &path).await {
-            Ok(final_filename) => {
-                filename = final_filename;
+        match finalize_file(&destination, &path).await {
+            Ok(()) => {
                 publish_update(
                     &app,
                     &manager,
@@ -1913,73 +2131,85 @@ fn validate_transition(current: &str, target: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn suggest_download_destination(
+    app: AppHandle,
+    manager: State<'_, DownloadManager>,
+    url: String,
+) -> Result<String, String> {
+    let parsed_url = reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err("Only HTTP and HTTPS download links are supported.".to_string());
+    }
+    let download_dir = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("Could not find the Downloads folder: {error}"))?;
+    std::fs::create_dir_all(&download_dir)
+        .map_err(|error| format!("Could not create the Downloads folder: {error}"))?;
+    let entries = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?;
+    suggested_destination(&download_dir, &filename_from_url(&parsed_url), &entries)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn start_download(
     app: AppHandle,
     manager: State<'_, DownloadManager>,
     url: String,
+    destination_path: String,
 ) -> Result<StartedDownload, String> {
     let parsed_url = reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
     if !matches!(parsed_url.scheme(), "http" | "https") {
         return Err("Only HTTP and HTTPS download links are supported.".to_string());
     }
 
-    let proposed_filename = filename_from_url(&parsed_url);
-    let download_dir = app
-        .path()
-        .download_dir()
-        .map_err(|error| format!("Could not find the Downloads folder: {error}"))?;
-    tokio::fs::create_dir_all(&download_dir)
-        .await
-        .map_err(|error| format!("Could not create the Downloads folder: {error}"))?;
+    let destination = resolve_destination(Path::new(&destination_path))?;
+    let filename = destination
+        .file_name()
+        .and_then(|part| part.to_str())
+        .ok_or_else(|| "The selected download filename is invalid.".to_string())?
+        .to_string();
+    let id = Uuid::new_v4().to_string();
+    let path = partial_path_for(&destination, &id);
 
-    let filename = {
-        let entries = manager
+    let (sender, receiver) = watch::channel(Control::Running);
+    {
+        let mut entries = manager
             .entries
             .lock()
             .map_err(|_| "Download state is unavailable.".to_string())?;
-        (0..10_000)
-            .map(|number| numbered_filename(&proposed_filename, number))
-            .find(|candidate| {
-                !download_dir.join(candidate).exists()
-                    && !entries.values().any(|entry| {
-                        entry.filename == *candidate
-                            && !matches!(entry.status.as_str(), "failed" | "cancelled")
-                    })
-            })
-            .ok_or_else(|| "Could not choose a unique download filename.".to_string())?
-    };
-    let id = Uuid::new_v4().to_string();
-    let path = download_dir.join(format!(".{id}.part"));
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .await
-        .map_err(|error| format!("Could not create the partial download: {error}"))?;
-
-    let (sender, receiver) = watch::channel(Control::Running);
-    manager
-        .entries
-        .lock()
-        .map_err(|_| "Download state is unavailable.".to_string())?
-        .insert(
+        ensure_destination_available(&destination, &entries)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("Could not create the partial download: {error}"))?;
+        entries.insert(
             id.clone(),
             DownloadEntry {
                 url: parsed_url.to_string(),
                 filename: filename.clone(),
+                destination: destination.clone(),
                 status: "queued".to_string(),
                 downloaded_bytes: 0,
                 total_bytes: None,
+                validator: None,
                 error: None,
                 control: sender,
+                task_lock: Arc::new(tokio::sync::Mutex::new(())),
             },
         );
+    }
     publish_update(&app, &manager, &id, &filename, "queued", 0, None, None);
 
     let app_handle = app.clone();
     let task_manager = manager.inner().clone();
     let download_url = parsed_url.to_string();
     let task_id = id.clone();
+    let task_destination = destination.clone();
     let task_filename = filename.clone();
     tauri::async_runtime::spawn(async move {
         download_file(
@@ -1988,7 +2218,7 @@ async fn start_download(
             task_id,
             download_url,
             task_filename,
-            download_dir,
+            task_destination,
             path,
             receiver,
         )
@@ -2047,6 +2277,157 @@ fn cancel_download(
     control_download(&app, &manager, &id, Control::Cancelled, "cancelled")
 }
 
+struct RetryDownload {
+    id: String,
+    url: String,
+    filename: String,
+    destination: PathBuf,
+    partial_path: PathBuf,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    control: watch::Receiver<Control>,
+}
+
+fn prepare_download_retry(manager: &DownloadManager, id: &str) -> Result<RetryDownload, String> {
+    let mut entries = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable.".to_string())?;
+    let entry = entries
+        .get(id)
+        .ok_or_else(|| format!("Download {id} was not found."))?;
+    if !matches!(entry.status.as_str(), "failed" | "cancelled") {
+        return Err("Only failed or cancelled downloads can be retried.".to_string());
+    }
+
+    let destination = entry.destination.clone();
+    ensure_destination_available(&destination, &entries)?;
+    let partial_path = partial_path_for(&destination, id);
+    let downloaded_bytes = match std::fs::metadata(&partial_path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return Err("The partial download path is not a file.".to_string()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial_path)
+                .map_err(|error| format!("Could not recreate the partial download: {error}"))?;
+            0
+        }
+        Err(error) => {
+            return Err(format!("Could not inspect the partial download: {error}"));
+        }
+    };
+
+    let entry = entries
+        .get_mut(id)
+        .ok_or_else(|| format!("Download {id} was not found."))?;
+    entry.control.send_replace(Control::Running);
+    let control = entry.control.subscribe();
+    entry.status = "queued".to_string();
+    entry.downloaded_bytes = downloaded_bytes;
+    entry.error = None;
+
+    Ok(RetryDownload {
+        id: id.to_string(),
+        url: entry.url.clone(),
+        filename: entry.filename.clone(),
+        destination,
+        partial_path,
+        downloaded_bytes,
+        total_bytes: entry.total_bytes,
+        control,
+    })
+}
+
+#[tauri::command]
+async fn retry_download(
+    app: AppHandle,
+    manager: State<'_, DownloadManager>,
+    id: String,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    let task_lock = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(&id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        if !matches!(entry.status.as_str(), "failed" | "cancelled") {
+            return Err("Only failed or cancelled downloads can be retried.".to_string());
+        }
+        entry.task_lock.clone()
+    };
+    let _task_guard = task_lock.lock().await;
+    let retry = prepare_download_retry(&manager, &id)?;
+    publish_update(
+        &app,
+        &manager,
+        &retry.id,
+        &retry.filename,
+        "queued",
+        retry.downloaded_bytes,
+        retry.total_bytes,
+        None,
+    );
+
+    let task_manager = manager.clone();
+    tauri::async_runtime::spawn(async move {
+        download_file(
+            app,
+            task_manager,
+            retry.id,
+            retry.url,
+            retry.filename,
+            retry.destination,
+            retry.partial_path,
+            retry.control,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn open_download_location(manager: State<'_, DownloadManager>, id: String) -> Result<(), String> {
+    let directory = {
+        let entries = manager
+            .entries
+            .lock()
+            .map_err(|_| "Download state is unavailable.".to_string())?;
+        let entry = entries
+            .get(&id)
+            .ok_or_else(|| format!("Download {id} was not found."))?;
+        entry
+            .destination
+            .parent()
+            .ok_or_else(|| "The download has no parent folder.".to_string())?
+            .to_path_buf()
+    };
+    if !directory.is_dir() {
+        return Err(format!(
+            "The download folder does not exist: {}",
+            directory.display()
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer.exe").arg(&directory).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(&directory).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(&directory).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    return Err("Opening the download folder is not supported on this platform.".to_string());
+
+    #[cfg(any(target_os = "windows", target_os = "macos", unix))]
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Could not open the download folder: {error}"))
+}
+
 #[tauri::command]
 fn get_download_settings(manager: State<'_, DownloadManager>) -> Result<DownloadSettings, String> {
     Ok(DownloadSettings {
@@ -2078,11 +2459,13 @@ mod tests {
     use super::{
         Control, DownloadAdmission, DownloadEntry, DownloadManager, DownloadUpdate,
         PersistedDownload, PersistedSettings, SlotResult, UpdateSink, acquire_download_slot,
-        download_file_inner, filename_from_url, is_reserved_windows_name, numbered_filename,
-        parse_content_range, persist_max_concurrent_downloads, persist_snapshot,
-        read_max_concurrent_downloads, read_persisted_queue, reconcile_persisted_status,
-        segment_ranges, valid_range_probe, valid_segment_response,
-        validate_max_concurrent_downloads, validate_transition, validators_compatible,
+        contiguous_segment_lengths, download_file_inner, ensure_destination_available,
+        filename_from_url, finalize_file, is_reserved_windows_name, numbered_filename,
+        parse_content_range, partial_path_for, persist_max_concurrent_downloads, persist_snapshot,
+        prepare_download_retry, read_max_concurrent_downloads, read_persisted_queue,
+        reconcile_persisted_status, restore_download_manager, segment_ranges, valid_range_probe,
+        valid_segment_response, validate_max_concurrent_downloads, validate_transition,
+        validators_compatible,
     };
     use std::{
         io::{Read, Write},
@@ -2104,6 +2487,7 @@ mod tests {
         MalformedSegmentRanges,
         ChangesValidator,
         SlowRanges,
+        SlowStreamingRanges,
     }
 
     struct LocalHttpServer {
@@ -2121,7 +2505,10 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let body = Arc::new(body);
             let range_requests = Arc::new(AtomicUsize::new(0));
-            let slow = Arc::new(AtomicBool::new(behavior == ServerBehavior::SlowRanges));
+            let slow = Arc::new(AtomicBool::new(matches!(
+                behavior,
+                ServerBehavior::SlowRanges | ServerBehavior::SlowStreamingRanges
+            )));
             let shutdown = Arc::new(AtomicBool::new(false));
 
             let thread_body = body.clone();
@@ -2205,7 +2592,13 @@ mod tests {
             }
             let bounds = value.trim().strip_prefix("bytes=")?;
             let (start, end) = bounds.split_once('-')?;
-            Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+            let start = start.parse::<u64>().ok()?;
+            let end = if end.is_empty() {
+                body.len().checked_sub(1)? as u64
+            } else {
+                end.parse::<u64>().ok()?
+            };
+            Some((start, end))
         });
         if range.is_some() {
             range_requests.fetch_add(1, Ordering::Relaxed);
@@ -2251,6 +2644,17 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
         }
+        if behavior == ServerBehavior::SlowStreamingRanges && range.is_some() && !is_probe {
+            for body_chunk in response_body.chunks(64 * 1024) {
+                if stream.write_all(body_chunk).is_err() {
+                    return;
+                }
+                while slow.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            return;
+        }
         let _ = stream.write_all(&response_body);
     }
 
@@ -2285,11 +2689,14 @@ mod tests {
                 DownloadEntry {
                     url: String::new(),
                     filename: "payload.bin".to_string(),
+                    destination: final_path.clone(),
                     status: "queued".to_string(),
                     downloaded_bytes: 0,
                     total_bytes: None,
+                    validator: None,
                     error: None,
                     control: control_sender.clone(),
+                    task_lock: Arc::new(tokio::sync::Mutex::new(())),
                 },
             );
             let manager = DownloadManager {
@@ -2330,7 +2737,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let manager = test_download.manager.clone();
         let id = test_download.id.clone();
-        let directory = test_download.directory.clone();
+        let destination = test_download.final_path.clone();
         let partial_path = test_download.partial_path.clone();
         let control_receiver = test_download.control_receiver.clone();
         let url = server.url.clone();
@@ -2342,7 +2749,7 @@ mod tests {
                 id,
                 url,
                 "payload.bin".to_string(),
-                directory,
+                destination,
                 partial_path,
                 control_receiver,
             )
@@ -2368,6 +2775,34 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("download did not reach status {status}");
+    }
+
+    async fn wait_for_segment_file(test_download: &TestDownload, index: usize) -> u64 {
+        let segment_path = test_download
+            .directory
+            .join(format!(".{}.segments", test_download.id))
+            .join(index.to_string());
+        for _ in 0..10_000 {
+            if let Ok(metadata) = std::fs::metadata(&segment_path) {
+                if metadata.len() > 0 {
+                    return metadata.len();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("segment {index} did not receive any bytes");
+    }
+
+    async fn wait_for_downloaded_bytes(test_download: &TestDownload, minimum: u64) {
+        for _ in 0..10_000 {
+            if test_download.manager.entries.lock().unwrap()[&test_download.id].downloaded_bytes
+                >= minimum
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("download did not publish at least {minimum} bytes");
     }
 
     fn test_payload(length: usize) -> Vec<u8> {
@@ -2435,6 +2870,20 @@ mod tests {
     }
 
     #[test]
+    fn segmented_pause_prefix_stops_at_first_gap_and_keeps_partial_segment() {
+        let expected = [10, 10, 10, 10];
+        assert_eq!(
+            contiguous_segment_lengths(&expected, &[Some(10), Some(4), Some(10), Some(10)]),
+            vec![10, 4]
+        );
+        assert_eq!(
+            contiguous_segment_lengths(&expected, &[Some(10), None, Some(10), Some(10)]),
+            vec![10]
+        );
+        assert!(contiguous_segment_lengths(&expected, &[Some(11), Some(10)]).is_empty());
+    }
+
+    #[test]
     fn segmented_response_validation_rejects_mismatched_ranges() {
         let partial = reqwest::StatusCode::PARTIAL_CONTENT;
         assert!(valid_segment_response(
@@ -2464,7 +2913,8 @@ mod tests {
     fn segmented_responses_reject_changed_validators() {
         assert!(validators_compatible(Some("\"one\""), Some("\"one\"")));
         assert!(!validators_compatible(Some("\"one\""), Some("\"two\"")));
-        assert!(validators_compatible(Some("\"one\""), None));
+        assert!(!validators_compatible(Some("\"one\""), None));
+        assert!(validators_compatible(None, None));
     }
 
     #[test]
@@ -2478,14 +2928,109 @@ mod tests {
         assert!(validate_transition("cancelled", "downloading").is_err());
     }
 
+    #[test]
+    fn retry_reuses_destination_and_preserves_partial_progress() {
+        let test_download = TestDownload::new();
+        std::fs::write(&test_download.partial_path, b"saved").unwrap();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = "https://example.com/payload.bin".to_string();
+            entry.status = "failed".to_string();
+            entry.error = Some("temporary error".to_string());
+            entry.control.send_replace(Control::Cancelled);
+        }
+
+        let retry = prepare_download_retry(&test_download.manager, &test_download.id).unwrap();
+
+        assert_eq!(retry.id, test_download.id);
+        assert_eq!(retry.url, "https://example.com/payload.bin");
+        assert_eq!(retry.destination, test_download.final_path);
+        assert_eq!(retry.downloaded_bytes, 5);
+        assert!(*retry.control.borrow() == Control::Running);
+        let entries = test_download.manager.entries.lock().unwrap();
+        let entry = &entries[&test_download.id];
+        assert_eq!(entry.status, "queued");
+        assert_eq!(entry.error, None);
+    }
+
+    #[tokio::test]
+    async fn retry_resumes_to_the_saved_destination() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let payload = test_payload(64 * 1024);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
+        let test_download = TestDownload::new();
+        let partial_bytes = 512;
+        std::fs::write(&test_download.partial_path, &payload[..partial_bytes]).unwrap();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = server.url.clone();
+            entry.status = "failed".to_string();
+            entry.total_bytes = Some(payload.len() as u64);
+            entry.validator = Some("\"stable\"".to_string());
+            entry.control.send_replace(Control::Cancelled);
+        }
+
+        let retry = prepare_download_retry(&test_download.manager, &test_download.id).unwrap();
+        let app: Arc<dyn UpdateSink> = Arc::new(TestUpdateSink);
+        download_file_inner(
+            app,
+            test_download.manager.clone(),
+            retry.id,
+            retry.url,
+            retry.filename,
+            retry.destination,
+            retry.partial_path,
+            retry.control,
+        )
+        .await;
+
+        assert_eq!(test_download.status(), "completed");
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn retry_recreates_missing_partial_for_cancelled_download() {
+        let test_download = TestDownload::new();
+        std::fs::remove_file(&test_download.partial_path).unwrap();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.status = "cancelled".to_string();
+            entry.control.send_replace(Control::Cancelled);
+        }
+
+        let retry = prepare_download_retry(&test_download.manager, &test_download.id).unwrap();
+
+        assert_eq!(retry.destination, test_download.final_path);
+        assert_eq!(retry.downloaded_bytes, 0);
+        assert!(test_download.partial_path.exists());
+        assert!(*retry.control.borrow() == Control::Running);
+    }
+
+    #[test]
+    fn retry_rejects_downloads_that_are_not_failed_or_cancelled() {
+        let test_download = TestDownload::new();
+
+        assert!(
+            prepare_download_retry(&test_download.manager, &test_download.id)
+                .err()
+                .unwrap()
+                .contains("Only failed or cancelled")
+        );
+    }
+
     fn persisted_download(status: &str, downloaded_bytes: u64) -> PersistedDownload {
         PersistedDownload {
             id: "c04e4566-0d5e-47c6-8863-9f2d6d327849".to_string(),
             url: "https://example.com/archive.zip".to_string(),
             filename: "archive.zip".to_string(),
+            destination: None,
             status: status.to_string(),
             downloaded_bytes,
             total_bytes: Some(12),
+            validator: None,
             error: None,
         }
     }
@@ -2525,18 +3070,73 @@ mod tests {
     }
 
     #[test]
+    fn destination_collision_is_rejected_without_overwriting_existing_content() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-destination-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("archive.zip");
+        std::fs::write(&destination, b"existing").unwrap();
+
+        assert!(
+            ensure_destination_available(&destination, &std::collections::HashMap::new()).is_err()
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+
+        std::fs::remove_file(&destination).unwrap();
+        let (control, _) = tokio::sync::watch::channel(Control::Running);
+        let entries = [(
+            "active".to_string(),
+            DownloadEntry {
+                url: String::new(),
+                filename: "archive.zip".to_string(),
+                destination: destination.clone(),
+                status: "queued".to_string(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                validator: None,
+                error: None,
+                control,
+                task_lock: Arc::new(tokio::sync::Mutex::new(())),
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(ensure_destination_available(&destination, &entries).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_collision_preserves_existing_file_and_partial() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-finalize-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("archive.zip");
+        let partial = directory.join(".partial");
+        std::fs::write(&destination, b"existing").unwrap();
+        std::fs::write(&partial, b"new data").unwrap();
+
+        let result = finalize_file(&destination, &partial).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"new data");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn persisted_queue_round_trips_and_uses_backup_when_primary_is_invalid() {
         let directory =
             std::env::temp_dir().join(format!("rustdload-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let queue_file = directory.join("downloads.json");
         let backup_file = directory.join("downloads.json.bak");
-        let record = persisted_download("paused", 7);
+        let mut record = persisted_download("paused", 7);
+        record.validator = Some("\"stable\"".to_string());
 
         persist_snapshot(&queue_file, std::slice::from_ref(&record)).unwrap();
         let restored = read_persisted_queue(&queue_file, &backup_file).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, record.id);
+        assert_eq!(restored[0].validator, record.validator);
 
         std::fs::write(&queue_file, b"{").unwrap();
         std::fs::write(&backup_file, serde_json::to_vec(&[record]).unwrap()).unwrap();
@@ -2580,6 +3180,81 @@ mod tests {
         assert_eq!(read_max_concurrent_downloads(&settings_file).unwrap(), 5);
         assert!(persist_max_concurrent_downloads(&settings_file, 0).is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restored_download_manager_uses_persisted_concurrency_limit() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let settings_file = directory.join("settings.json");
+        let persistence_file = directory.join("downloads.json");
+        let download_dir = directory.join("downloads");
+
+        persist_max_concurrent_downloads(&settings_file, 7).unwrap();
+        let (manager, _) = super::restore_download_manager(persistence_file, &download_dir)
+            .expect("download manager should restore persisted settings");
+
+        assert_eq!(manager.admission.limit().unwrap(), 7);
+        drop(manager);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chosen_destination_and_partial_resume_survive_restart() {
+        let _http_guard = HTTP_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("rustdload-resume-{}", uuid::Uuid::new_v4()));
+        let chosen_directory = root.join("chosen-folder");
+        std::fs::create_dir_all(&chosen_directory).unwrap();
+        let download_dir = root.join("default-downloads");
+        let persistence_file = root.join("downloads.json");
+        let payload = test_payload(300_000);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
+        let id = uuid::Uuid::new_v4().to_string();
+        let destination = chosen_directory.join("custom-name.bin");
+        let partial = partial_path_for(&destination, &id);
+        let prefix = &payload[..64];
+        std::fs::write(&partial, prefix).unwrap();
+
+        let mut record = persisted_download("downloading", prefix.len() as u64);
+        record.id = id.clone();
+        record.url = server.url.clone();
+        record.filename = "custom-name.bin".to_string();
+        record.destination = Some(destination.to_string_lossy().into_owned());
+        persist_snapshot(&persistence_file, &[record]).unwrap();
+
+        let (manager, recovered) =
+            restore_download_manager(persistence_file, &download_dir).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].destination.as_deref(),
+            Some(destination.to_str().unwrap())
+        );
+        let receiver = {
+            let mut entries = manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&id).unwrap();
+            assert_eq!(entry.destination, destination);
+            assert_eq!(entry.status, "paused");
+            assert_eq!(entry.downloaded_bytes, prefix.len() as u64);
+            entry.control.send_replace(Control::Running);
+            entry.control.subscribe()
+        };
+        let app: Arc<dyn UpdateSink> = Arc::new(TestUpdateSink);
+        download_file_inner(
+            app,
+            manager,
+            id,
+            server.url.clone(),
+            "custom-name.bin".to_string(),
+            destination.clone(),
+            partial,
+            receiver,
+        )
+        .await;
+
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        assert!(server.range_requests.load(Ordering::Acquire) > 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2725,6 +3400,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_http_segmented_pause_preserves_contiguous_progress_and_resumes() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let payload = test_payload(8 * 1024 * 1024);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowStreamingRanges);
+        let test_download = TestDownload::new();
+        let task = start_test_download(&server, &test_download);
+
+        let first_segment_bytes = wait_for_segment_file(&test_download, 0).await;
+        assert!(first_segment_bytes > 0);
+        test_download.control_sender.send_replace(Control::Paused);
+        wait_for_downloaded_bytes(&test_download, first_segment_bytes).await;
+        wait_for_status(&test_download, "paused").await;
+
+        let paused_bytes = std::fs::metadata(&test_download.partial_path)
+            .unwrap()
+            .len();
+        assert!(paused_bytes >= first_segment_bytes);
+        assert!(paused_bytes < payload.len() as u64);
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].validator,
+            Some("\"stable\"".to_string())
+        );
+
+        server.slow.store(false, Ordering::Release);
+        test_download.control_sender.send_replace(Control::Running);
+        task.await.unwrap();
+
+        assert_eq!(test_download.status(), "completed");
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+    }
+
+    #[tokio::test]
     async fn local_http_download_can_be_cancelled_during_range_probe() {
         let _guard = HTTP_TEST_LOCK.lock().unwrap();
         let server =
@@ -2771,8 +3478,12 @@ pub fn run() {
                     })?;
                 let task_manager = manager.clone();
                 let task_app = app.handle().clone();
-                let partial_path = download_dir.join(format!(".{}.part", record.id));
-                let task_directory = download_dir.clone();
+                let destination = record
+                    .destination
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| download_dir.join(&record.filename));
+                let partial_path = partial_path_for(&destination, &record.id);
                 let task_id = record.id.clone();
                 let task_url = record.url.clone();
                 let task_filename = record.filename.clone();
@@ -2783,7 +3494,7 @@ pub fn run() {
                         task_id,
                         task_url,
                         task_filename,
-                        task_directory,
+                        destination,
                         partial_path,
                         receiver,
                     )
@@ -2793,14 +3504,18 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            suggest_download_destination,
             start_download,
             pause_download,
             resume_download,
             cancel_download,
+            retry_download,
+            open_download_location,
             list_downloads,
             get_download_settings,
             set_max_concurrent_downloads
         ])
+        .plugin(tauri_plugin_dialog::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,14 +1,30 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "cancelled";
-type DownloadFilter = "all" | "active" | "completed";
+type DownloadFilter = "all" | "downloading" | "queued" | "completed";
 type DownloadAction = "pause" | "resume" | "cancel" | "retry";
 type DownloadSort = "recent" | "name" | "size" | "progress";
 type DownloadGrouping = "none" | "status";
 type AppPage = "downloads" | "settings";
+type IconName =
+  | "download"
+  | "arrowDown"
+  | "queue"
+  | "check"
+  | "settings"
+  | "search"
+  | "plus"
+  | "more"
+  | "play"
+  | "pause"
+  | "copy"
+  | "folder"
+  | "retry"
+  | "cancel";
 
 type Download = {
   id: string;
@@ -26,10 +42,11 @@ type DownloadSettings = { maxConcurrentDownloads: number };
 type TransferSample = { bytes: number; at: number };
 type DownloadGroup = { id: string; label: string; downloads: Download[] };
 
-const filters: { id: DownloadFilter; label: string }[] = [
-  { id: "all", label: "All downloads" },
-  { id: "active", label: "Active" },
-  { id: "completed", label: "Completed" },
+const filters: { id: DownloadFilter; label: string; icon: IconName }[] = [
+  { id: "all", label: "All", icon: "download" },
+  { id: "downloading", label: "Downloading", icon: "arrowDown" },
+  { id: "queued", label: "Queued", icon: "queue" },
+  { id: "completed", label: "Completed", icon: "check" },
 ];
 
 const statusOrder: DownloadStatus[] = ["downloading", "queued", "paused", "failed", "completed", "cancelled"];
@@ -61,14 +78,43 @@ function formatEta(seconds: number): string {
 }
 
 function transferRate(samples: TransferSample[], now: number): number | null {
-  if (samples.length < 3) return null;
+  if (samples.length < 2) return null;
   const recent = samples.filter((sample) => now - sample.at <= 8_000);
   const first = recent[0];
   const last = recent[recent.length - 1];
-  if (recent.length < 3 || !first || !last || now - last.at > 4_000 || last.at - first.at < 2_000 || last.bytes <= first.bytes) {
+  const elapsed = last && first ? last.at - first.at : 0;
+  if (
+    recent.length < 2 ||
+    !first ||
+    !last ||
+    now - last.at > 3_000 ||
+    elapsed < 750 ||
+    last.bytes <= first.bytes
+  ) {
     return null;
   }
-  return ((last.bytes - first.bytes) * 1000) / (last.at - first.at);
+  const rate = ((last.bytes - first.bytes) * 1000) / elapsed;
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+function Icon({ name }: { name: IconName }) {
+  const paths: Record<IconName, React.ReactNode> = {
+    download: <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 20h14" /></>,
+    arrowDown: <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /></>,
+    queue: <><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="M4 6h.01" /><path d="M4 12h.01" /><path d="M4 18h.01" /></>,
+    check: <><path d="m5 12 4 4L19 6" /></>,
+    settings: <><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z" /><path d="m19.4 15 .1.1a1.7 1.7 0 0 1-2.4 2.4L17 17.4a1.7 1.7 0 0 0-2.9 1.2v.2a1.7 1.7 0 0 1-3.4 0v-.2a1.7 1.7 0 0 0-2.9-1.2l-.1.1a1.7 1.7 0 0 1-2.4-2.4l.1-.1a1.7 1.7 0 0 0-1.2-2.9H4a1.7 1.7 0 0 1 0-3.4h.2a1.7 1.7 0 0 0 1.2-2.9l-.1-.1a1.7 1.7 0 0 1 2.4-2.4l.1.1a1.7 1.7 0 0 0 2.9-1.2V4a1.7 1.7 0 0 1 3.4 0v.2a1.7 1.7 0 0 0 2.9 1.2l.1-.1a1.7 1.7 0 0 1 2.4 2.4l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.2a1.7 1.7 0 0 1 0 3.4h-.2a1.7 1.7 0 0 0-1.2.9Z" /></>,
+    search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
+    plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
+    more: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
+    play: <><path d="m8 5 11 7-11 7z" /></>,
+    pause: <><path d="M8 5v14" /><path d="M16 5v14" /></>,
+    copy: <><rect x="8" y="8" width="12" height="13" rx="1.5" /><path d="M16 8V5H5v12h3" /></>,
+    folder: <><path d="M3 7.5h7l2 2h9v9H3z" /><path d="M3 7.5V5h7l2 2" /></>,
+    retry: <><path d="M20 7v5h-5" /><path d="M19 12a7 7 0 1 0 1 4" /></>,
+    cancel: <><path d="m6 6 12 12M18 6 6 18" /></>,
+  };
+  return <svg aria-hidden="true" className="icon" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">{paths[name]}</svg>;
 }
 
 function sourceFor(download: Download): string | null {
@@ -123,6 +169,10 @@ function App() {
   const [concurrencyDraft, setConcurrencyDraft] = useState("3");
   const [settingsError, setSettingsError] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ downloadId: string; x: number; y: number } | null>(null);
+  const [noticeMessage, setNoticeMessage] = useState("");
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -133,6 +183,7 @@ function App() {
         const stopListening = await listen<DownloadUpdate>("download-update", ({ payload }) => {
           setDownloads((current) => upsertDownload(current, payload));
           const sample = { bytes: payload.downloadedBytes, at: performance.now() };
+          setClock(sample.at);
           setTransferSamples((current) => {
             const previous = current[payload.id] ?? [];
             if (payload.status !== "downloading") {
@@ -146,11 +197,7 @@ function App() {
               return { ...current, [payload.id]: [sample] };
             }
             if (last && sample.bytes === last.bytes) return current;
-            const nextSamples =
-              last && sample.at - last.at < 750
-                ? [...previous.slice(0, -1), sample]
-                : [...previous, sample];
-            return { ...current, [payload.id]: nextSamples.slice(-12) };
+            return { ...current, [payload.id]: [...previous, sample].slice(-40) };
           });
         });
         if (disposed) {
@@ -183,12 +230,27 @@ function App() {
     };
   }, []);
 
-  const activeCount = useMemo(() => downloads.filter((download) => isActive(download.status)).length, [downloads]);
+  const downloadingCount = useMemo(
+    () => downloads.filter((download) => download.status === "downloading").length,
+    [downloads],
+  );
+  const queuedCount = useMemo(
+    () => downloads.filter((download) => download.status === "queued" || download.status === "paused").length,
+    [downloads],
+  );
   const completedCount = useMemo(
     () => downloads.filter((download) => download.status === "completed").length,
     [downloads],
   );
   const hasDownloading = downloads.some((download) => download.status === "downloading");
+  const totalSpeed = useMemo(
+    () =>
+      downloads.reduce((total, download) => {
+        if (download.status !== "downloading") return total;
+        return total + (transferRate(transferSamples[download.id] ?? [], clock) ?? 0);
+      }, 0),
+    [clock, downloads, transferSamples],
+  );
 
   useEffect(() => {
     if (!hasDownloading) return;
@@ -196,10 +258,28 @@ function App() {
     return () => window.clearInterval(timer);
   }, [hasDownloading]);
 
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+      } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        urlInputRef.current?.focus();
+      } else if (event.key === "Escape") {
+        setContextMenu(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
   const visibleDownloads = useMemo(() => {
     const normalizedSearch = search.trim().toLocaleLowerCase();
     const filtered = downloads.filter((download) => {
-      if (filter === "active" && !isActive(download.status)) return false;
+      if (filter === "downloading" && download.status !== "downloading") return false;
+      if (filter === "queued" && download.status !== "queued" && download.status !== "paused") return false;
       if (filter === "completed" && download.status !== "completed") return false;
       if (!normalizedSearch) return true;
       return [download.filename, download.url ?? "", download.error ?? "", statusLabel(download.status)]
@@ -236,7 +316,10 @@ function App() {
     setErrorMessage("");
     if (clearInput) setIsStarting(true);
     try {
-      const started = await invoke<StartedDownload>("start_download", { url: submittedUrl });
+      const defaultPath = await invoke<string>("suggest_download_destination", { url: submittedUrl });
+      const destinationPath = await save({ defaultPath, title: "Save download as" });
+      if (destinationPath === null) return;
+      const started = await invoke<StartedDownload>("start_download", { url: submittedUrl, destinationPath });
       setDownloads((current) => {
         const existing = current.some((download) => download.id === started.id);
         if (existing) {
@@ -275,16 +358,57 @@ function App() {
     if (busyActionId) return;
     setBusyActionId(download.id);
     setErrorMessage("");
+    setNoticeMessage("");
     try {
       if (action === "pause") await invoke("pause_download", { id: download.id });
       else if (action === "resume") await invoke("resume_download", { id: download.id });
       else if (action === "cancel") await invoke("cancel_download", { id: download.id });
-      else if (download.url) await enqueueDownload(download.url);
+      else if (download.url) await invoke("retry_download", { id: download.id });
       else throw new Error("The original link is unavailable, so this download cannot be retried.");
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
       setBusyActionId(null);
+    }
+  }
+
+  function showContextMenu(downloadId: string, x: number, y: number) {
+    const menuWidth = 236;
+    const menuHeight = 280;
+    setContextMenu({
+      downloadId,
+      x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
+    });
+  }
+
+  async function copyDownloadLink(download: Download) {
+    setContextMenu(null);
+    setErrorMessage("");
+    if (!download.url) {
+      setErrorMessage("The original link is unavailable, so it cannot be copied.");
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is unavailable.");
+      }
+      await navigator.clipboard.writeText(download.url);
+      setNoticeMessage("Download link copied to clipboard.");
+    } catch (error) {
+      setErrorMessage(`Could not copy the download link: ${String(error)}`);
+    }
+  }
+
+  async function openDownloadLocation(download: Download) {
+    setContextMenu(null);
+    setErrorMessage("");
+    setNoticeMessage("");
+    try {
+      await invoke("open_download_location", { id: download.id });
+    } catch (error) {
+      setErrorMessage(String(error));
     }
   }
 
@@ -313,24 +437,25 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </div>
-          <div>
-            <div className="brand-name">RustDLoad</div>
-            <div className="brand-caption">DOWNLOAD MANAGER</div>
-          </div>
+          <span className="brand-mark"><Icon name="download" /></span>
+          <span className="brand-name">RustDLoad</span>
         </div>
 
         <div className="sidebar-section-label">LIBRARY</div>
         <nav className="nav-list" aria-label="Download filters">
           {filters.map((item) => {
-            const count = item.id === "active" ? activeCount : item.id === "completed" ? completedCount : downloads.length;
+            const count =
+              item.id === "all"
+                ? downloads.length
+                : item.id === "downloading"
+                  ? downloadingCount
+                  : item.id === "queued"
+                    ? queuedCount
+                    : completedCount;
             return (
               <button
-                className={`nav-item ${filter === item.id ? "selected" : ""}`}
+                aria-current={filter === item.id && page === "downloads" ? "page" : undefined}
+                className={`nav-item ${filter === item.id && page === "downloads" ? "selected" : ""}`}
                 key={item.id}
                 onClick={() => {
                   setPage("downloads");
@@ -338,62 +463,56 @@ function App() {
                 }}
                 type="button"
               >
-                <span className={`nav-icon nav-icon-${item.id}`} aria-hidden="true">
-                  {item.id === "all" ? "↓" : item.id === "active" ? "◷" : "✓"}
-                </span>
+                <Icon name={item.icon} />
                 <span>{item.label}</span>
                 <span className="nav-count">{count}</span>
               </button>
             );
           })}
+          <div className="sidebar-section-label tools-label">PREFERENCES</div>
           <button
+            aria-current={page === "settings" ? "page" : undefined}
             className={`nav-item ${page === "settings" ? "selected" : ""}`}
             onClick={() => setPage("settings")}
             type="button"
           >
-            <span className="nav-icon" aria-hidden="true">⚙</span>
+            <Icon name="settings" />
             <span>Settings</span>
           </button>
         </nav>
 
         <div className="sidebar-footer">
-          <span className="engine-indicator" />
-          <div>
-            <div className="engine-title">Download engine</div>
-            <div className="engine-caption">Up to {maxConcurrentDownloads} downloads at once</div>
-          </div>
-          <span className="engine-state">READY</span>
+          <span>Concurrent downloads</span>
+          <strong>{maxConcurrentDownloads}</strong>
         </div>
       </aside>
 
       <main className="main-panel">
         <header className="topbar">
           <div className="breadcrumb">
-            <span>Workspace</span>
+            <span>RustDLoad</span>
             <span className="breadcrumb-divider">/</span>
             <strong>{page === "settings" ? "Settings" : "Downloads"}</strong>
           </div>
-          <div className="open-source-tag">
-            <span className="tag-dot" />
-            Free &amp; open source
+          <div className="topbar-hints">
+            <span><kbd>Ctrl</kbd>+<kbd>F</kbd> Search</span>
+            <span><kbd>Ctrl</kbd>+<kbd>L</kbd> Add URL</span>
           </div>
         </header>
 
         <section className={`content ${page === "settings" ? "settings-content" : ""}`}>
           {page === "settings" ? (
             <>
-              <div className="page-heading">
+              <div className="section-heading">
                 <div>
-                  <div className="eyebrow">PREFERENCES</div>
                   <h1>Settings</h1>
-                  <p className="page-subtitle">Configure how RustDLoad manages your transfers.</p>
+                  <p>Configure how RustDLoad manages your transfers.</p>
                 </div>
               </div>
-
               <form className="settings-card" onSubmit={saveSettings}>
                 <div className="settings-copy">
                   <h2>Concurrent downloads</h2>
-                  <p>Choose how many downloads may transfer at the same time. The range is 1–10.</p>
+                  <p>Choose how many downloads may transfer at the same time.</p>
                 </div>
                 <label className="settings-field" htmlFor="max-concurrent-downloads">
                   <span>Maximum active transfers</span>
@@ -409,261 +528,301 @@ function App() {
                   />
                 </label>
                 <p className="settings-note">
-                  Lowering this limit won’t stop running downloads; queued downloads wait until capacity is available.
+                  Lowering this limit won’t stop running downloads; queued downloads wait for capacity.
                 </p>
                 {settingsError && <p className="settings-error" role="alert">{settingsError}</p>}
                 <button className="start-button settings-save" disabled={isSavingSettings} type="submit">
                   {isSavingSettings ? "Saving…" : "Save settings"}
                 </button>
               </form>
-
-              <footer className="content-footer">
-                <span>Current limit: {maxConcurrentDownloads} concurrent {maxConcurrentDownloads === 1 ? "download" : "downloads"}</span>
-              </footer>
             </>
           ) : (
             <>
-          <div className="page-heading">
-            <div>
-              <div className="eyebrow">YOUR LIBRARY</div>
-              <h1>Downloads</h1>
-              <p className="page-subtitle">Keep your files moving. Add a link to get started.</p>
-            </div>
-            <div className="download-summary">
-              <div className="summary-icon" aria-hidden="true">↓</div>
-              <div>
-                <div className="summary-value">{activeCount}</div>
-                <div className="summary-label">ACTIVE JOBS</div>
-              </div>
-            </div>
-          </div>
-
-          <form className="add-download-card" onSubmit={startDownload}>
-            <label htmlFor="download-url">Add a download</label>
-            <div className="url-entry">
-              <span className="url-icon" aria-hidden="true">↗</span>
-              <input
-                autoComplete="url"
-                id="download-url"
-                onChange={(event) => setUrl(event.currentTarget.value)}
-                placeholder="Paste a direct file link (https://...)"
-                type="url"
-                value={url}
-                required
-              />
-              <button className="start-button" disabled={isStarting} type="submit">
-                <span aria-hidden="true">{isStarting ? "…" : "↓"}</span>
-                {isStarting ? "Starting" : "Start download"}
-              </button>
-            </div>
-            <div className="form-hint">
-              <span className="hint-lock" aria-hidden="true">⌑</span>
-              Files are saved to your Downloads folder
-              <span className="hint-separator">·</span>
-              HTTP and HTTPS links supported
-              <span className="hint-separator">·</span>
-              Up to {maxConcurrentDownloads} run at once
-            </div>
-          </form>
-
-          {errorMessage && (
-            <div className="error-banner" role="alert">
-              <span>{errorMessage}</span>
-              <button aria-label="Dismiss error" onClick={() => setErrorMessage("")} type="button">×</button>
-            </div>
-          )}
-
-          <div className="list-toolbar">
-            <div>
-              <h2>{filter === "all" ? "Recent downloads" : filter === "active" ? "Active downloads" : "Completed downloads"}</h2>
-              <span className="list-count">{visibleDownloads.length} {visibleDownloads.length === 1 ? "item" : "items"}</span>
-            </div>
-            <div className="list-meta">
-              <span className="live-dot" />
-              LIVE UPDATES
-            </div>
-          </div>
-
-          <div className="list-controls">
-            <label className="download-search">
-              <span className="control-icon" aria-hidden="true">⌕</span>
-              <input
-                aria-label="Search downloads"
-                onChange={(event) => setSearch(event.currentTarget.value)}
-                placeholder="Search downloads"
-                type="search"
-                value={search}
-              />
-            </label>
-            <label className="select-control">
-              <span>Sort</span>
-              <select aria-label="Sort downloads" onChange={(event) => setSortBy(event.currentTarget.value as DownloadSort)} value={sortBy}>
-                <option value="recent">Recently added</option>
-                <option value="name">Name</option>
-                <option value="size">File size</option>
-                <option value="progress">Progress</option>
-              </select>
-            </label>
-            <label className="select-control">
-              <span>Group</span>
-              <select aria-label="Group downloads" onChange={(event) => setGroupBy(event.currentTarget.value as DownloadGrouping)} value={groupBy}>
-                <option value="none">No grouping</option>
-                <option value="status">By status</option>
-              </select>
-            </label>
-          </div>
-
-          {visibleDownloads.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-art" aria-hidden="true">
-                <div className="empty-file">
-                  <span className="file-fold" />
-                  <span className="file-line line-one" />
-                  <span className="file-line line-two" />
-                  <span className="file-line line-three" />
+              <div className="download-toolbar">
+                <div className="section-heading">
+                  <div>
+                    <h1>Downloads</h1>
+                    <p>{downloads.length} {downloads.length === 1 ? "item" : "items"} · {downloadingCount} downloading · {queuedCount} queued</p>
+                  </div>
                 </div>
-                <div className="empty-arrow">↓</div>
-                <div className="empty-ground" />
+                <form className="add-download-card" onSubmit={startDownload}>
+                  <label className="visually-hidden" htmlFor="download-url">Download URL</label>
+                  <input
+                    autoComplete="url"
+                    id="download-url"
+                    onChange={(event) => setUrl(event.currentTarget.value)}
+                    placeholder="Paste a direct file URL"
+                    ref={urlInputRef}
+                    type="url"
+                    value={url}
+                    required
+                  />
+                  <button className="start-button" disabled={isStarting} type="submit">
+                    <Icon name="plus" />
+                    {isStarting ? "Choosing location…" : "Add download"}
+                  </button>
+                </form>
               </div>
-              <h3>{search.trim() ? "No matching downloads" : downloads.length === 0 ? "Your download list is empty" : `No ${filter} downloads`}</h3>
-              <p>{search.trim() ? "Try a different name, address or status." : "Paste a direct file link above and it will appear here."}</p>
-            </div>
-          ) : (
-            <div className="download-list">
-              {downloadGroups.map((group) => (
-                <section aria-label={group.label || "Downloads"} className="download-group" key={group.id}>
-                  {group.label && (
-                    <h3 className="group-heading">
-                      <span>{group.label}</span>
-                      <span>{group.downloads.length}</span>
-                    </h3>
-                  )}
-                  {group.downloads.map((download) => {
-                const progress = progressFor(download);
-                const isBusy = busyActionId !== null;
-                const speed = download.status === "downloading"
-                  ? transferRate(transferSamples[download.id] ?? [], clock)
-                  : null;
-                const source = sourceFor(download);
-                const eta = speed !== null && download.totalBytes !== null
-                  ? (download.totalBytes - download.downloadedBytes) / speed
-                  : null;
-                const progressWidth =
-                  progress !== null
-                    ? `${progress}%`
-                    : download.status === "completed"
-                      ? "100%"
-                      : download.status === "downloading"
-                        ? "34%"
-                        : "0%";
+
+              {errorMessage && (
+                <div className="error-banner" role="alert">
+                  <span>{errorMessage}</span>
+                  <button aria-label="Dismiss error" onClick={() => setErrorMessage("")} type="button">×</button>
+                </div>
+              )}
+              {noticeMessage && (
+                <div className="notice-banner" role="status" aria-live="polite">
+                  <span>{noticeMessage}</span>
+                  <button aria-label="Dismiss notification" onClick={() => setNoticeMessage("")} type="button">×</button>
+                </div>
+              )}
+
+              <div className="table-toolbar">
+                <div className="filter-title">
+                  <h2>{filters.find((item) => item.id === filter)?.label ?? "Downloads"}</h2>
+                  <span>{visibleDownloads.length}</span>
+                </div>
+                <label className="download-search">
+                  <Icon name="search" />
+                  <input
+                    aria-label="Search downloads"
+                    onChange={(event) => setSearch(event.currentTarget.value)}
+                    placeholder="Search"
+                    ref={searchInputRef}
+                    type="search"
+                    value={search}
+                  />
+                </label>
+                <label className="select-control">
+                  <span>Sort</span>
+                  <select aria-label="Sort downloads" onChange={(event) => setSortBy(event.currentTarget.value as DownloadSort)} value={sortBy}>
+                    <option value="recent">Recently added</option>
+                    <option value="name">Name</option>
+                    <option value="size">File size</option>
+                    <option value="progress">Progress</option>
+                  </select>
+                </label>
+                <label className="select-control">
+                  <span>Group</span>
+                  <select aria-label="Group downloads" onChange={(event) => setGroupBy(event.currentTarget.value as DownloadGrouping)} value={groupBy}>
+                    <option value="none">None</option>
+                    <option value="status">Status</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="table-scroll">
+                <table className="download-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Name</th>
+                      <th scope="col">Size</th>
+                      <th scope="col">Progress</th>
+                      <th scope="col">Speed</th>
+                      <th scope="col">ETA</th>
+                      <th scope="col">Status</th>
+                      <th scope="col"><span className="visually-hidden">Actions</span></th>
+                    </tr>
+                  </thead>
+                  {downloadGroups.map((group) => (
+                    <tbody aria-label={group.label || "Downloads"} key={group.id}>
+                      {group.label && (
+                        <tr className="group-row">
+                          <th colSpan={7} scope="rowgroup">
+                            {group.label}<span>{group.downloads.length}</span>
+                          </th>
+                        </tr>
+                      )}
+                      {group.downloads.map((download) => {
+                        const progress = progressFor(download);
+                        const speed =
+                          download.status === "downloading"
+                            ? transferRate(transferSamples[download.id] ?? [], clock)
+                            : null;
+                        const eta =
+                          speed !== null && download.totalBytes !== null
+                            ? (download.totalBytes - download.downloadedBytes) / speed
+                            : null;
+                        const source = sourceFor(download);
+                        const progressWidth =
+                          progress !== null
+                            ? `${progress}%`
+                            : download.status === "completed"
+                              ? "100%"
+                              : "0%";
+                        return (
+                          <tr
+                            className={`download-row ${download.status}`}
+                            key={download.id}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              showContextMenu(download.id, event.clientX, event.clientY);
+                            }}
+                          >
+                            <td className="name-cell">
+                              <span className={`file-status-icon ${download.status}`}>
+                                <Icon name={download.status === "completed" ? "check" : download.status === "downloading" ? "arrowDown" : "download"} />
+                              </span>
+                              <span className="name-text">
+                                <span title={download.filename}>{download.filename}</span>
+                                {source && <small title={download.url}>{source}</small>}
+                              </span>
+                            </td>
+                            <td className="size-cell numeric">
+                              {download.totalBytes === null ? "Unknown" : formatBytes(download.totalBytes)}
+                            </td>
+                            <td className="progress-cell">
+                              <div
+                                aria-label={progress === null ? `${formatBytes(download.downloadedBytes)} downloaded, total unknown` : `${progress}% complete`}
+                                className="progress-track"
+                              >
+                                <div
+                                  className={`progress-fill ${download.status}`}
+                                  style={{ width: progressWidth }}
+                                />
+                              </div>
+                              <div className="progress-meta numeric">
+                                <span>
+                                  {download.totalBytes === null
+                                    ? `${formatBytes(download.downloadedBytes)} downloaded`
+                                    : `${formatBytes(download.downloadedBytes)} of ${formatBytes(download.totalBytes)}`}
+                                </span>
+                                <span>{progress === null ? "—" : `${progress}%`}</span>
+                              </div>
+                            </td>
+                            <td className="numeric speed-cell">
+                              {speed === null
+                                ? download.status === "downloading" ? "Measuring…" : "—"
+                                : formatSpeed(speed)}
+                            </td>
+                            <td className="numeric">
+                              {eta !== null && eta >= 0 ? formatEta(eta) : "—"}
+                            </td>
+                            <td>
+                              <span className={`status-label ${download.status}`}>
+                                <span className="status-dot" />
+                                {statusLabel(download.status)}
+                              </span>
+                            </td>
+                            <td className="action-cell">
+                              <div className="row-actions">
+                                {isActive(download.status) && (
+                                  <button
+                                    aria-label={`${download.status === "paused" ? "Resume" : "Pause"} ${download.filename}`}
+                                    className="row-action-button transfer-action"
+                                    disabled={busyActionId !== null}
+                                    onClick={() =>
+                                      void runDownloadAction(
+                                        download,
+                                        download.status === "paused" ? "resume" : "pause",
+                                      )
+                                    }
+                                    title={download.status === "paused" ? "Resume download" : "Pause download"}
+                                    type="button"
+                                  >
+                                    <Icon name={download.status === "paused" ? "play" : "pause"} />
+                                  </button>
+                                )}
+                                <button
+                                  aria-haspopup="menu"
+                                  aria-label={`Actions for ${download.filename}`}
+                                  className="row-action-button more-button"
+                                  disabled={busyActionId !== null}
+                                  onClick={(event) => showContextMenu(download.id, event.clientX, event.clientY)}
+                                  title="More actions"
+                                  type="button"
+                                >
+                                  <Icon name="more" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  ))}
+                </table>
+                {visibleDownloads.length === 0 && (
+                  <div className="empty-state">
+                    <strong>{search.trim() ? "No matching downloads" : `No ${filter === "all" ? "" : `${filters.find((item) => item.id === filter)?.label.toLowerCase()} `}downloads`}</strong>
+                    <span>{search.trim() ? "Try a different search." : "Add a direct file URL to start a download."}</span>
+                  </div>
+                )}
+              </div>
+
+              {contextMenu && (() => {
+                const download = downloads.find((item) => item.id === contextMenu.downloadId);
+                if (!download) return null;
+                const closeMenu = () => setContextMenu(null);
+                const runAction = (action: DownloadAction) => {
+                  closeMenu();
+                  void runDownloadAction(download, action);
+                };
                 return (
-                  <article className="download-row" key={download.id}>
-                    <div className={`file-icon ${download.status}`} aria-hidden="true">
-                      {download.status === "completed"
-                        ? "✓"
-                        : download.status === "failed"
-                          ? "!"
-                          : download.status === "cancelled"
-                            ? "×"
-                            : download.status === "paused"
-                              ? "Ⅱ"
-                              : "↓"}
-                    </div>
-                    <div className="download-details">
-                      <div className="download-title-line">
-                        <div className="download-name">
-                          <h3 title={download.filename}>{download.filename}</h3>
-                          {source && <span className="download-source" title={download.url}>{source}</span>}
-                        </div>
-                        <span className={`status-pill ${download.status}`}>
-                          <span className="status-dot" />
-                          {statusLabel(download.status)}
-                        </span>
-                      </div>
-                      <div className="progress-track" aria-label={progress === null ? "Download progress unknown" : `${progress}% complete`}>
-                        <div
-                          className={`progress-fill ${download.status} ${progress === null && download.status === "downloading" ? "indeterminate" : ""}`}
-                          style={{ width: progressWidth }}
-                        />
-                      </div>
-                      <div className="download-meta">
-                        {download.error ? (
-                          <span className="download-error">{download.error}</span>
-                        ) : (
-                          <span>
-                            {download.totalBytes !== null
-                              ? `${formatBytes(download.downloadedBytes)} of ${formatBytes(download.totalBytes)}`
-                              : `${formatBytes(download.downloadedBytes)} downloaded · size unknown`}
-                          </span>
-                        )}
-                        {progress !== null && <span className="progress-percent">{progress}%</span>}
-                      </div>
-                      {download.status === "downloading" && (
-                        <div className="transfer-meta" aria-live="polite">
-                          <span>{speed === null ? "Measuring speed…" : formatSpeed(speed)}</span>
-                          {eta !== null && eta >= 0 && <span>About {formatEta(eta)} left</span>}
-                        </div>
-                      )}
-                    </div>
-                    <div className="row-actions">
-                      {(download.status === "downloading" || download.status === "queued") && (
-                        <button
-                          className="row-action-button"
-                          disabled={isBusy}
-                          onClick={() => void runDownloadAction(download, "pause")}
-                          type="button"
-                        >
-                          {busyActionId === download.id ? "Working…" : "Pause"}
-                        </button>
-                      )}
+                  <div className="context-layer" onClick={closeMenu} onContextMenu={(event) => { event.preventDefault(); closeMenu(); }}>
+                    <div
+                      className="context-menu"
+                      role="menu"
+                      style={{ left: contextMenu.x, top: contextMenu.y }}
+                      onClick={(event) => event.stopPropagation()}
+                    >
                       {download.status === "paused" && (
-                        <button
-                          className="row-action-button primary"
-                          disabled={isBusy}
-                          onClick={() => void runDownloadAction(download, "resume")}
-                          type="button"
-                        >
-                          {busyActionId === download.id ? "Working…" : "Resume"}
+                        <button onClick={() => runAction("resume")} role="menuitem" type="button">
+                          <Icon name="play" />
+                          Start / Resume
                         </button>
                       )}
-                      {download.status === "failed" && download.url && (
-                        <button
-                          className="row-action-button"
-                          disabled={isBusy}
-                          onClick={() => void runDownloadAction(download, "retry")}
-                          type="button"
-                        >
+                      {download.url && (download.status === "failed" || download.status === "cancelled") && (
+                        <button onClick={() => runAction("retry")} role="menuitem" type="button">
+                          <Icon name="retry" />
                           Retry
                         </button>
                       )}
+                      {(download.status === "downloading" || download.status === "queued") && (
+                        <button onClick={() => runAction("pause")} role="menuitem" type="button">
+                          <Icon name="pause" />
+                          Pause
+                        </button>
+                      )}
                       {isActive(download.status) && (
-                        <button
-                          aria-label={`Cancel ${download.filename}`}
-                          className="row-action-button cancel"
-                          disabled={isBusy}
-                          onClick={() => void runDownloadAction(download, "cancel")}
-                          type="button"
-                        >
+                        <button className="danger-menu-item" onClick={() => runAction("cancel")} role="menuitem" type="button">
+                          <Icon name="cancel" />
                           Cancel
                         </button>
                       )}
+                      {(isActive(download.status) || download.status === "failed" || download.status === "cancelled") && (
+                        <div className="context-menu-divider" role="separator" />
+                      )}
+                      {download.url && (
+                        <button onClick={() => void copyDownloadLink(download)} role="menuitem" type="button">
+                          <Icon name="copy" />
+                          Copy download link
+                        </button>
+                      )}
+                      <button onClick={() => void openDownloadLocation(download)} role="menuitem" type="button">
+                        <Icon name="folder" />
+                        Open download location
+                      </button>
                     </div>
-                  </article>
+                  </div>
                 );
-                  })}
-                </section>
-              ))}
-            </div>
-          )}
-
-          <footer className="content-footer">
-            <span>Built with Rust + Tauri</span>
-            <span className="footer-separator">·</span>
-            <span>Downloads are stored locally on your device</span>
-          </footer>
+              })()}
             </>
           )}
         </section>
+
+        <footer className="statusbar" role="status" aria-live="polite">
+          <div className="statusbar-item">
+            <span className={`status-dot ${downloadingCount > 0 ? "live" : ""}`} />
+            <strong>{downloadingCount > 0 && totalSpeed === 0 ? "Measuring…" : formatSpeed(totalSpeed)}</strong>
+            <span>Total speed</span>
+          </div>
+          <span className="statusbar-divider" />
+          <div className="statusbar-item"><strong>{downloadingCount}</strong><span>downloading</span></div>
+          <div className="statusbar-item"><strong>{queuedCount}</strong><span>queued</span></div>
+          <span className="statusbar-spacer" />
+          <span className="statusbar-limit">{maxConcurrentDownloads} max connections</span>
+        </footer>
       </main>
     </div>
   );
