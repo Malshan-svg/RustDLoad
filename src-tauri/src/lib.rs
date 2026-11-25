@@ -7,13 +7,13 @@ use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
     sync::{Notify, watch},
 };
 use uuid::Uuid;
@@ -23,6 +23,8 @@ const MIN_CONCURRENT_DOWNLOADS: usize = 1;
 const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 const MAX_SEGMENTS_PER_DOWNLOAD: usize = 4;
 const MIN_SEGMENTED_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024;
+const PERSISTED_FORMAT_VERSION: u32 = 1;
+const SEGMENT_RESUME_VERSION: u32 = 1;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,15 +59,17 @@ struct SegmentRequest {
     app: Arc<dyn UpdateSink>,
     manager: DownloadManager,
     url: String,
-    path: PathBuf,
+    partial_path: PathBuf,
     filename: String,
     id: String,
-    start: u64,
-    end: u64,
+    segment_index: usize,
+    segment_end: u64,
+    position: u64,
     total: u64,
     validator: Option<String>,
     progress: Arc<AtomicU64>,
     last_progress_update: Arc<Mutex<Instant>>,
+    tracker: SegmentResumeTracker,
     control: watch::Receiver<Control>,
 }
 
@@ -76,8 +80,35 @@ struct SegmentedDownloadContext<'a> {
     id: &'a str,
     url: &'a str,
     filename: &'a str,
-    directory: &'a Path,
     path: &'a Path,
+    sidecar_path: &'a Path,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentPosition {
+    start: u64,
+    end: u64,
+    position: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentResumeState {
+    version: u32,
+    url: String,
+    final_url: String,
+    total_size: u64,
+    validator: Option<String>,
+    segments: Vec<SegmentPosition>,
+}
+
+#[derive(Clone)]
+struct SegmentResumeTracker {
+    state: Arc<tokio::sync::Mutex<SegmentResumeState>>,
+    path: PathBuf,
+    persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    last_saved: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 fn remember_validator(manager: &DownloadManager, id: &str, validator: Option<String>) {
@@ -214,7 +245,24 @@ struct PersistedDownload {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedSettings {
+    #[serde(default)]
+    version: u32,
     max_concurrent_downloads: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedQueue {
+    #[serde(default)]
+    version: u32,
+    downloads: Vec<PersistedDownload>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedQueueDocument {
+    Versioned(PersistedQueue),
+    Legacy(Vec<PersistedDownload>),
 }
 
 #[derive(Serialize)]
@@ -319,7 +367,11 @@ impl DownloadManager {
 }
 
 fn persist_snapshot(path: &Path, snapshot: &[PersistedDownload]) -> Result<(), String> {
-    let serialized = serde_json::to_vec_pretty(snapshot)
+    let queue = PersistedQueue {
+        version: PERSISTED_FORMAT_VERSION,
+        downloads: snapshot.to_vec(),
+    };
+    let serialized = serde_json::to_vec_pretty(&queue)
         .map_err(|error| format!("Could not serialize the download queue: {error}"))?;
     persist_json(path, &serialized, "download queue")
 }
@@ -358,6 +410,9 @@ fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
             .map_err(|error| format!("Could not read download settings: {error}"))?;
         let settings: PersistedSettings = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Could not parse download settings: {error}"))?;
+        if settings.version > PERSISTED_FORMAT_VERSION {
+            return Err("The saved download settings use a newer unsupported format.".to_string());
+        }
         validate_max_concurrent_downloads(settings.max_concurrent_downloads)
     };
 
@@ -378,6 +433,7 @@ fn read_max_concurrent_downloads(path: &Path) -> Result<usize, String> {
 
 fn persist_max_concurrent_downloads(path: &Path, limit: usize) -> Result<(), String> {
     let settings = PersistedSettings {
+        version: PERSISTED_FORMAT_VERSION,
         max_concurrent_downloads: validate_max_concurrent_downloads(limit)?,
     };
     let serialized = serde_json::to_vec_pretty(&settings)
@@ -457,10 +513,48 @@ fn restore_download_manager(
         let destination_directory = destination.parent().unwrap();
         remove_stale_segment_directory(destination_directory, &record.id);
         let partial_path = partial_path_for(&destination, &record.id);
+        let sidecar_path = segment_sidecar_path(&destination);
+        let sidecar_present = sidecar_path.exists();
+        let sidecar_state = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
+        {
+            match read_segment_resume_state(&sidecar_path) {
+                Ok(state) => state.filter(|state| state.url == record.url),
+                Err(error) => {
+                    record.status = "failed".to_string();
+                    record.error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(state) = sidecar_state.as_ref() {
+            record.total_bytes = Some(state.total_size);
+            record.validator = state.validator.clone();
+        }
         let partial_size = if matches!(record.status.as_str(), "queued" | "downloading" | "paused")
         {
             match std::fs::metadata(&partial_path) {
-                Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+                Ok(metadata)
+                    if metadata.is_file()
+                        && sidecar_state
+                            .as_ref()
+                            .is_some_and(|state| metadata.len() == state.total_size) =>
+                {
+                    Some(segment_progress(sidecar_state.as_ref().unwrap()))
+                }
+                Ok(metadata)
+                    if metadata.is_file() && sidecar_state.is_none() && !sidecar_present =>
+                {
+                    Some(metadata.len())
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    eprintln!(
+                        "Restarting segmented download {} because its preallocated file is incomplete.",
+                        record.id
+                    );
+                    Some(0)
+                }
                 Ok(_) => {
                     record.status = "failed".to_string();
                     record.error = Some("The partial download path is not a file.".to_string());
@@ -577,6 +671,125 @@ fn partial_path_for(destination: &Path, id: &str) -> PathBuf {
         .join(format!(".{id}.part"))
 }
 
+fn segment_sidecar_path(destination: &Path) -> PathBuf {
+    let filename = destination
+        .file_name()
+        .map(|filename| filename.to_string_lossy())
+        .unwrap_or_default();
+    destination.with_file_name(format!("{filename}.rdl"))
+}
+
+fn segment_progress(state: &SegmentResumeState) -> u64 {
+    state
+        .segments
+        .iter()
+        .map(|segment| segment.position.saturating_sub(segment.start))
+        .sum()
+}
+
+fn valid_segment_resume_state(state: &SegmentResumeState) -> bool {
+    if state.version != SEGMENT_RESUME_VERSION || state.total_size == 0 || state.segments.is_empty()
+    {
+        return false;
+    }
+
+    let mut next_start = 0;
+    for segment in &state.segments {
+        if segment.start != next_start
+            || segment.end < segment.start
+            || segment.position < segment.start
+            || segment.position > segment.end.saturating_add(1)
+        {
+            return false;
+        }
+        next_start = segment.end.saturating_add(1);
+    }
+    next_start == state.total_size
+}
+
+fn read_segment_resume_state(path: &Path) -> Result<Option<SegmentResumeState>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not read the resume sidecar: {error}")),
+    };
+    match serde_json::from_slice::<SegmentResumeState>(&bytes) {
+        Ok(state) if valid_segment_resume_state(&state) => Ok(Some(state)),
+        Ok(_) | Err(_) => {
+            eprintln!("Ignoring an invalid segmented-download resume sidecar.");
+            Ok(None)
+        }
+    }
+}
+
+async fn persist_segment_resume_state(
+    path: &Path,
+    state: &SegmentResumeState,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("Could not serialize the resume sidecar: {error}"))?;
+    let temporary_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .map(|filename| filename.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    let mut file = tokio::fs::File::create(&temporary_path)
+        .await
+        .map_err(|error| format!("Could not create the resume sidecar: {error}"))?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|error| format!("Could not write the resume sidecar: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("Could not flush the resume sidecar: {error}"))?;
+    drop(file);
+    tokio::fs::rename(&temporary_path, path)
+        .await
+        .map_err(|error| format!("Could not save the resume sidecar: {error}"))
+}
+
+async fn remove_segment_sidecar(path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not remove the download resume sidecar {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+impl SegmentResumeTracker {
+    async fn checkpoint(&self, index: usize, position: u64, force: bool) -> Result<(), String> {
+        let _persistence_guard = self.persistence_lock.lock().await;
+        let mut last_saved = self.last_saved.lock().await;
+        if !force && last_saved.elapsed() < Duration::from_secs(1) {
+            return Ok(());
+        }
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            state.segments[index].position = position;
+            state.clone()
+        };
+        persist_segment_resume_state(&self.path, &snapshot).await?;
+        *last_saved = Instant::now();
+        Ok(())
+    }
+
+    async fn persist(&self) -> Result<(), String> {
+        let _persistence_guard = self.persistence_lock.lock().await;
+        let snapshot = self.state.lock().await.clone();
+        persist_segment_resume_state(&self.path, &snapshot).await?;
+        *self.last_saved.lock().await = Instant::now();
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> SegmentResumeState {
+        self.state.lock().await.clone()
+    }
+}
+
 fn read_persisted_queue(
     persistence_file: &Path,
     backup_file: &Path,
@@ -584,8 +797,19 @@ fn read_persisted_queue(
     let read = |path: &Path| -> Result<Vec<PersistedDownload>, String> {
         let contents = std::fs::read(path)
             .map_err(|error| format!("Could not read the download queue: {error}"))?;
-        serde_json::from_slice(&contents)
-            .map_err(|error| format!("Could not parse the download queue: {error}"))
+        let document: PersistedQueueDocument = serde_json::from_slice(&contents)
+            .map_err(|error| format!("Could not parse the download queue: {error}"))?;
+        match document {
+            PersistedQueueDocument::Legacy(downloads) => Ok(downloads),
+            PersistedQueueDocument::Versioned(queue)
+                if queue.version <= PERSISTED_FORMAT_VERSION =>
+            {
+                Ok(queue.downloads)
+            }
+            PersistedQueueDocument::Versioned(_) => {
+                Err("The saved download queue uses a newer unsupported format.".to_string())
+            }
+        }
     };
     if persistence_file.exists() {
         match read(persistence_file) {
@@ -939,8 +1163,22 @@ async fn finish_failed<S: UpdateSink + ?Sized>(
         total_bytes,
         message,
     } = failure;
+    let sidecar_path = match manager.entries.lock() {
+        Ok(entries) => entries
+            .get(id)
+            .map(|entry| segment_sidecar_path(&entry.destination)),
+        Err(_) => {
+            eprintln!("Download state is unavailable while cleaning up the resume sidecar.");
+            None
+        }
+    };
     let message = match remove_partial_file(path).await {
         Ok(()) => {
+            if let Some(sidecar_path) = sidecar_path.as_deref()
+                && let Err(error) = remove_segment_sidecar(sidecar_path).await
+            {
+                eprintln!("{error}");
+            }
             let cancelled = match manager.entries.lock() {
                 Ok(entries) => entries
                     .get(id)
@@ -1000,6 +1238,19 @@ macro_rules! finish_failed {
 enum SlotResult {
     Acquired(DownloadPermit),
     Cancelled,
+}
+
+fn pause_active_downloads(manager: &DownloadManager) -> Result<(), String> {
+    let entries = manager
+        .entries
+        .lock()
+        .map_err(|_| "Download state is unavailable during shutdown.".to_string())?;
+    for entry in entries.values() {
+        if entry.status == "downloading" {
+            entry.control.send_replace(Control::Paused);
+        }
+    }
+    Ok(())
 }
 
 async fn acquire_download_slot(
@@ -1070,23 +1321,10 @@ enum SegmentedAttempt {
 }
 
 enum SegmentWorkerResult {
-    Completed(u64),
+    Completed,
     Invalid,
     Controlled(Control),
-}
-
-fn contiguous_segment_lengths(expected: &[u64], actual: &[Option<u64>]) -> Vec<u64> {
-    let mut prefix = Vec::new();
-    for (expected, actual) in expected.iter().zip(actual) {
-        let Some(actual) = actual.filter(|actual| *actual > 0 && *actual <= *expected) else {
-            break;
-        };
-        prefix.push(actual);
-        if actual < *expected {
-            break;
-        }
-    }
-    prefix
+    Failed(String),
 }
 
 async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
@@ -1095,24 +1333,32 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
         app,
         manager,
         url,
-        path,
+        partial_path,
         filename,
         id,
-        start,
-        end,
+        segment_index,
+        segment_end,
+        position,
         total,
         validator,
         progress,
         last_progress_update,
+        tracker,
         mut control,
     } = request;
+    if position > segment_end {
+        return SegmentWorkerResult::Completed;
+    }
     if *control.borrow() != Control::Running {
         return SegmentWorkerResult::Controlled(*control.borrow());
     }
 
     let mut request = client
         .get(url)
-        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={position}-{segment_end}"),
+        )
         .header(reqwest::header::ACCEPT_ENCODING, "identity");
     if let Some(validator) = validator.as_deref() {
         request = request.header(reqwest::header::IF_RANGE, validator);
@@ -1135,21 +1381,38 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range);
-    if !valid_segment_response(response.status(), content_range, start, end, total)
-        || !validators_compatible(
-            validator.as_deref(),
-            response_validator(&response).as_deref(),
-        )
-        || response
-            .content_length()
-            .is_some_and(|length| length != end - start + 1)
+    if !valid_segment_response(
+        response.status(),
+        content_range,
+        position,
+        segment_end,
+        total,
+    ) || !validators_compatible(
+        validator.as_deref(),
+        response_validator(&response).as_deref(),
+    ) || response
+        .content_length()
+        .is_some_and(|length| length != segment_end - position + 1)
     {
         return SegmentWorkerResult::Invalid;
     }
 
-    let mut file = match tokio::fs::File::create(path).await {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(partial_path)
+        .await
+    {
         Ok(file) => file,
-        Err(_) => return SegmentWorkerResult::Invalid,
+        Err(error) => {
+            return SegmentWorkerResult::Failed(format!(
+                "Could not open the partial download for a segment: {error}"
+            ));
+        }
+    };
+    if let Err(error) = file.seek(std::io::SeekFrom::Start(position)).await {
+        return SegmentWorkerResult::Failed(format!(
+            "Could not position a download segment: {error}"
+        ));
     };
     let mut stream = response.bytes_stream();
     let mut written = 0u64;
@@ -1157,10 +1420,13 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
         tokio::select! {
             chunk = stream.next() => match chunk {
                 Some(Ok(chunk)) => {
-                    if written.saturating_add(chunk.len() as u64) > end - start + 1
-                        || file.write_all(&chunk).await.is_err()
-                    {
+                    if written.saturating_add(chunk.len() as u64) > segment_end - position + 1 {
                         return SegmentWorkerResult::Invalid;
+                    }
+                    if let Err(error) = file.write_all(&chunk).await {
+                        return SegmentWorkerResult::Failed(format!(
+                            "Could not write a download segment: {error}"
+                        ));
                     }
                     written += chunk.len() as u64;
                     let downloaded = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed)
@@ -1180,6 +1446,22 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
                             );
                             *last_update = Instant::now();
                     }
+                    let checkpoint_due = {
+                        tracker.last_saved.lock().await.elapsed() >= Duration::from_secs(1)
+                    };
+                    if checkpoint_due {
+                        if let Err(error) = file.sync_data().await {
+                            return SegmentWorkerResult::Failed(format!(
+                                "Could not checkpoint a download segment: {error}"
+                            ));
+                        }
+                        if let Err(error) = tracker
+                            .checkpoint(segment_index, position + written, false)
+                            .await
+                        {
+                            return SegmentWorkerResult::Failed(error);
+                        }
+                    }
                 }
                 Some(Err(_)) => return SegmentWorkerResult::Invalid,
                 None => break,
@@ -1187,8 +1469,21 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
             changed = control.changed() => {
                 if changed.is_err() || *control.borrow() != Control::Running {
                     let state = *control.borrow();
-                    if state == Control::Paused && file.flush().await.is_err() {
-                        return SegmentWorkerResult::Invalid;
+                    if let Err(error) = file.flush().await {
+                        return SegmentWorkerResult::Failed(format!(
+                            "Could not flush a paused download segment: {error}"
+                        ));
+                    }
+                    if let Err(error) = file.sync_data().await {
+                        return SegmentWorkerResult::Failed(format!(
+                            "Could not checkpoint a download segment: {error}"
+                        ));
+                    }
+                    if let Err(error) = tracker
+                        .checkpoint(segment_index, position + written, true)
+                        .await
+                    {
+                        return SegmentWorkerResult::Failed(error);
                     }
                     return SegmentWorkerResult::Controlled(state);
                 }
@@ -1196,10 +1491,59 @@ async fn fetch_segment(request: SegmentRequest) -> SegmentWorkerResult {
             }
         }
     }
-    if file.flush().await.is_err() || written != end - start + 1 {
+    if let Err(error) = file.flush().await {
+        return SegmentWorkerResult::Failed(format!("Could not flush a download segment: {error}"));
+    }
+    if let Err(error) = file.sync_data().await {
+        return SegmentWorkerResult::Failed(format!(
+            "Could not checkpoint a download segment: {error}"
+        ));
+    }
+    if written != segment_end - position + 1 {
         SegmentWorkerResult::Invalid
     } else {
-        SegmentWorkerResult::Completed(written)
+        match tracker
+            .checkpoint(segment_index, segment_end + 1, true)
+            .await
+        {
+            Ok(()) => SegmentWorkerResult::Completed,
+            Err(error) => SegmentWorkerResult::Failed(error),
+        }
+    }
+}
+
+async fn create_preallocated_partial(path: &Path, total: u64) -> Result<(), String> {
+    let file = tokio::fs::File::create(path)
+        .await
+        .map_err(|error| format!("Could not prepare the partial download: {error}"))?;
+    file.set_len(total)
+        .await
+        .map_err(|error| format!("Could not preallocate the partial download: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("Could not flush the preallocated download: {error}"))
+}
+
+fn new_segment_resume_state(
+    url: &str,
+    final_url: &str,
+    total: u64,
+    validator: Option<String>,
+) -> SegmentResumeState {
+    SegmentResumeState {
+        version: SEGMENT_RESUME_VERSION,
+        url: url.to_string(),
+        final_url: final_url.to_string(),
+        total_size: total,
+        validator,
+        segments: segment_ranges(total, MAX_SEGMENTS_PER_DOWNLOAD)
+            .into_iter()
+            .map(|(start, end)| SegmentPosition {
+                start,
+                end,
+                position: start,
+            })
+            .collect(),
     }
 }
 
@@ -1214,13 +1558,25 @@ async fn try_segmented_download(
         id,
         url,
         filename,
-        directory,
         path,
+        sidecar_path,
     } = context;
+    let old_state = read_segment_resume_state(sidecar_path)?;
+    let old_progress = old_state.as_ref().map(segment_progress).unwrap_or(0);
     if *control.borrow() != Control::Running {
         return Ok(match *control.borrow() {
-            Control::Paused => SegmentedAttempt::Paused(0, 0, None),
-            Control::Cancelled => SegmentedAttempt::Cancelled(0, 0),
+            Control::Paused => SegmentedAttempt::Paused(
+                old_progress,
+                old_state
+                    .as_ref()
+                    .map(|state| state.total_size)
+                    .unwrap_or(0),
+                old_state.and_then(|state| state.validator),
+            ),
+            Control::Cancelled => SegmentedAttempt::Cancelled(
+                old_progress,
+                old_state.map(|state| state.total_size).unwrap_or(0),
+            ),
             Control::Running => unreachable!(),
         });
     }
@@ -1233,11 +1589,21 @@ async fn try_segmented_download(
         result = probe_request.send() => result.map_err(|error| error.to_string())?,
         changed = control.changed() => {
             return Ok(match *control.borrow() {
-                Control::Paused => SegmentedAttempt::Paused(0, 0, None),
-                Control::Cancelled => SegmentedAttempt::Cancelled(0, 0),
+                Control::Paused => SegmentedAttempt::Paused(
+                    old_progress,
+                    old_state.as_ref().map(|state| state.total_size).unwrap_or(0),
+                    old_state.as_ref().and_then(|state| state.validator.clone()),
+                ),
+                Control::Cancelled => SegmentedAttempt::Cancelled(
+                    old_progress,
+                    old_state.as_ref().map(|state| state.total_size).unwrap_or(0),
+                ),
                 Control::Running => {
                     if changed.is_err() {
-                        SegmentedAttempt::Cancelled(0, 0)
+                        SegmentedAttempt::Cancelled(
+                            old_progress,
+                            old_state.as_ref().map(|state| state.total_size).unwrap_or(0),
+                        )
                     } else {
                         SegmentedAttempt::Fallback
                     }
@@ -1251,14 +1617,27 @@ async fn try_segmented_download(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range);
+    let final_url = probe.url().to_string();
     let Some((0, 0, total)) = probe_range else {
+        if sidecar_path.exists() {
+            create_preallocated_partial(path, 0).await?;
+            remove_segment_sidecar(sidecar_path).await?;
+        }
         return Ok(SegmentedAttempt::Fallback);
     };
     if probe_status != reqwest::StatusCode::PARTIAL_CONTENT || total < MIN_SEGMENTED_DOWNLOAD_SIZE {
+        if sidecar_path.exists() {
+            create_preallocated_partial(path, 0).await?;
+            remove_segment_sidecar(sidecar_path).await?;
+        }
         return Ok(SegmentedAttempt::Fallback);
     }
     let validator = response_validator(&probe);
     if probe.content_length().is_some_and(|length| length != 1) {
+        if sidecar_path.exists() {
+            create_preallocated_partial(path, 0).await?;
+            remove_segment_sidecar(sidecar_path).await?;
+        }
         return Ok(SegmentedAttempt::Fallback);
     }
     let mut probe_stream = probe.bytes_stream();
@@ -1277,7 +1656,11 @@ async fn try_segmented_download(
             },
             changed = control.changed() => {
                 return Ok(match *control.borrow() {
-                    Control::Paused => SegmentedAttempt::Paused(0, total, validator.clone()),
+                    Control::Paused => SegmentedAttempt::Paused(
+                        old_progress,
+                        total,
+                        old_state.as_ref().and_then(|state| state.validator.clone()),
+                    ),
                     Control::Cancelled => SegmentedAttempt::Cancelled(0, total),
                     Control::Running => {
                         if changed.is_err() {
@@ -1291,59 +1674,83 @@ async fn try_segmented_download(
         }
     }
     if valid_range_probe(probe_status, probe_range, probe_body_length) != Some(total) {
+        if sidecar_path.exists() {
+            create_preallocated_partial(path, 0).await?;
+            remove_segment_sidecar(sidecar_path).await?;
+        }
         return Ok(SegmentedAttempt::Fallback);
     }
     remember_validator(manager, id, validator.clone());
 
-    let segment_directory = directory.join(format!(".{id}.segments"));
-    match tokio::fs::remove_dir_all(&segment_directory).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Could not prepare download segments: {error}")),
-    }
-    tokio::fs::create_dir(&segment_directory)
+    let partial_size = tokio::fs::metadata(path)
         .await
-        .map_err(|error| format!("Could not prepare download segments: {error}"))?;
-
-    let ranges = segment_ranges(total, MAX_SEGMENTS_PER_DOWNLOAD);
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len());
+    let resume_state = old_state.filter(|state| {
+        state.url == url
+            && state.final_url == final_url
+            && state.total_size == total
+            && state.validator == validator
+            && partial_size == Some(total)
+    });
+    let state = if let Some(state) = resume_state {
+        state
+    } else {
+        let state = new_segment_resume_state(url, &final_url, total, validator.clone());
+        persist_segment_resume_state(sidecar_path, &state).await?;
+        create_preallocated_partial(path, total).await?;
+        state
+    };
+    let tracker = SegmentResumeTracker {
+        state: Arc::new(tokio::sync::Mutex::new(state.clone())),
+        path: sidecar_path.to_path_buf(),
+        persistence_lock: Arc::default(),
+        last_saved: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+    };
+    let initial_progress = segment_progress(&state);
     publish_update!(
         app,
         manager,
         id,
         filename,
         "downloading",
-        0,
+        initial_progress,
         Some(total),
         None,
     );
     let mut workers = tokio::task::JoinSet::new();
-    let progress = Arc::new(AtomicU64::new(0));
-    let last_progress_update = Arc::new(Mutex::new(Instant::now()));
-    for (index, (start, end)) in ranges.iter().copied().enumerate() {
+    let progress = Arc::new(AtomicU64::new(initial_progress));
+    let last_progress_update = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+    for (index, segment) in state.segments.iter().enumerate() {
+        if segment.position > segment.end {
+            continue;
+        }
         workers.spawn(fetch_segment(SegmentRequest {
             client: client.clone(),
             app: app.clone(),
             manager: manager.clone(),
-            url: url.to_string(),
-            path: segment_directory.join(index.to_string()),
+            url: final_url.clone(),
+            partial_path: path.to_path_buf(),
             filename: filename.to_string(),
             id: id.to_string(),
-            start,
-            end,
+            segment_index: index,
+            segment_end: segment.end,
+            position: segment.position,
             total,
             validator: validator.clone(),
             progress: progress.clone(),
             last_progress_update: last_progress_update.clone(),
+            tracker: tracker.clone(),
             control: control.clone(),
         }));
     }
 
-    let mut completed_bytes = 0u64;
     let mut attempt = SegmentedAttempt::Completed(total);
+    let mut worker_error = None;
     while let Some(result) = workers.join_next().await {
         match result {
-            Ok(SegmentWorkerResult::Completed(bytes)) => {
-                completed_bytes += bytes;
+            Ok(SegmentWorkerResult::Completed) => {
                 if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
                     publish_update!(
                         app,
@@ -1358,19 +1765,31 @@ async fn try_segmented_download(
                 }
             }
             Ok(SegmentWorkerResult::Controlled(Control::Paused)) => {
-                attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
+                attempt = SegmentedAttempt::Paused(
+                    progress.load(Ordering::Relaxed),
+                    total,
+                    validator.clone(),
+                );
             }
             Ok(SegmentWorkerResult::Controlled(Control::Cancelled)) => {
-                attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
+                attempt = SegmentedAttempt::Cancelled(progress.load(Ordering::Relaxed), total);
+                break;
+            }
+            Ok(SegmentWorkerResult::Failed(error)) => {
+                worker_error = Some(error);
                 break;
             }
             Ok(SegmentWorkerResult::Controlled(Control::Running))
             | Ok(SegmentWorkerResult::Invalid) => match *control.borrow() {
                 Control::Paused => {
-                    attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
+                    attempt = SegmentedAttempt::Paused(
+                        progress.load(Ordering::Relaxed),
+                        total,
+                        validator.clone(),
+                    );
                 }
                 Control::Cancelled => {
-                    attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
+                    attempt = SegmentedAttempt::Cancelled(progress.load(Ordering::Relaxed), total);
                     break;
                 }
                 Control::Running if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) => {
@@ -1381,10 +1800,14 @@ async fn try_segmented_download(
             },
             Err(_) => match *control.borrow() {
                 Control::Paused => {
-                    attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
+                    attempt = SegmentedAttempt::Paused(
+                        progress.load(Ordering::Relaxed),
+                        total,
+                        validator.clone(),
+                    );
                 }
                 Control::Cancelled => {
-                    attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
+                    attempt = SegmentedAttempt::Cancelled(progress.load(Ordering::Relaxed), total);
                     break;
                 }
                 Control::Running if !matches!(attempt, SegmentedAttempt::Paused(_, _, _)) => {
@@ -1405,81 +1828,25 @@ async fn try_segmented_download(
     if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
         let _ = control.borrow_and_update();
     }
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    tracker.persist().await?;
+    let saved_state = tracker.snapshot().await;
+    let saved_progress = segment_progress(&saved_state);
 
-    if matches!(attempt, SegmentedAttempt::Completed(_)) && completed_bytes != total {
+    if matches!(attempt, SegmentedAttempt::Completed(_)) && saved_progress != total {
         attempt = SegmentedAttempt::Fallback;
     }
-    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) && completed_bytes == total {
+    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) && saved_progress == total {
         attempt = SegmentedAttempt::Completed(total);
     }
-    let assembly_lengths = match &attempt {
-        SegmentedAttempt::Completed(_) => ranges
-            .iter()
-            .map(|(start, end)| end - start + 1)
-            .collect::<Vec<_>>(),
-        SegmentedAttempt::Paused(_, _, Some(_)) => {
-            let mut actual = Vec::with_capacity(ranges.len());
-            for index in 0..ranges.len() {
-                actual.push(
-                    tokio::fs::metadata(segment_directory.join(index.to_string()))
-                        .await
-                        .ok()
-                        .map(|metadata| metadata.len()),
-                );
-            }
-            let expected: Vec<_> = ranges.iter().map(|(start, end)| end - start + 1).collect();
-            contiguous_segment_lengths(&expected, &actual)
-        }
-        SegmentedAttempt::Paused(_, _, None) => Vec::new(),
-        _ => Vec::new(),
-    };
-    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) || !assembly_lengths.is_empty() {
-        let mut output = tokio::fs::File::create(path)
-            .await
-            .map_err(|error| format!("Could not assemble the download: {error}"))?;
-        for (index, length) in assembly_lengths.iter().copied().enumerate() {
-            let segment = tokio::fs::File::open(segment_directory.join(index.to_string()))
-                .await
-                .map_err(|error| format!("Could not read a download segment: {error}"))?;
-            let mut segment = segment.take(length);
-            tokio::select! {
-                result = tokio::io::copy(&mut segment, &mut output) => {
-                    result.map_err(|error| format!("Could not assemble the download: {error}"))?;
-                }
-                changed = control.changed() => {
-                    let state = *control.borrow();
-                    if changed.is_err() || state == Control::Cancelled {
-                        attempt = SegmentedAttempt::Cancelled(completed_bytes, total);
-                    } else if state == Control::Paused {
-                        attempt = SegmentedAttempt::Paused(completed_bytes, total, validator.clone());
-                    } else {
-                        attempt = SegmentedAttempt::Fallback;
-                    }
-                    break;
-                }
-            }
-        }
-        output
-            .flush()
-            .await
-            .map_err(|error| format!("Could not assemble the download: {error}"))?;
-        drop(output);
-    }
-    if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
-        let progress = tokio::fs::metadata(path)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        attempt = SegmentedAttempt::Paused(progress, total, validator);
-    }
     if matches!(attempt, SegmentedAttempt::Fallback) {
-        tokio::fs::File::create(path)
-            .await
-            .map_err(|error| format!("Could not reset the partial download: {error}"))?;
+        create_preallocated_partial(path, 0).await?;
+        remove_segment_sidecar(sidecar_path).await?;
+    } else if matches!(attempt, SegmentedAttempt::Paused(_, _, _)) {
+        attempt = SegmentedAttempt::Paused(saved_progress, total, validator);
     }
-    tokio::fs::remove_dir_all(&segment_directory)
-        .await
-        .map_err(|error| format!("Could not clean up download segments: {error}"))?;
     Ok(attempt)
 }
 
@@ -1521,10 +1888,7 @@ async fn download_file_inner(
         partial_path: path,
     } = download;
     let client = reqwest::Client::new();
-    let directory = destination
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let sidecar_path = segment_sidecar_path(&destination);
     let mut validator = manager
         .entries
         .lock()
@@ -1532,23 +1896,36 @@ async fn download_file_inner(
         .and_then(|entries| entries.get(&id).and_then(|entry| entry.validator.clone()));
     let mut total_bytes = None;
     let mut last_update = Instant::now();
+    let mut force_sequential = false;
 
     loop {
-        let offset = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                finish_failed!(
-                    &app,
-                    &manager,
-                    &id,
-                    &filename,
-                    &path,
-                    0,
-                    total_bytes,
-                    format!("Could not inspect the partial download: {error}"),
-                )
-                .await;
-                return;
+        let offset = if sidecar_path.exists() {
+            match read_segment_resume_state(&sidecar_path) {
+                Ok(Some(state)) if state.url == url => segment_progress(&state),
+                Ok(_) => 0,
+                Err(error) => {
+                    finish_failed!(&app, &manager, &id, &filename, &path, 0, total_bytes, error,)
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    finish_failed!(
+                        &app,
+                        &manager,
+                        &id,
+                        &filename,
+                        &path,
+                        0,
+                        total_bytes,
+                        format!("Could not inspect the partial download: {error}"),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
 
@@ -1567,6 +1944,9 @@ async fn download_file_inner(
                         Some(error),
                     );
                 } else {
+                    if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
+                        eprintln!("{error}");
+                    }
                     publish_update!(
                         &app,
                         &manager,
@@ -1606,7 +1986,7 @@ async fn download_file_inner(
             None,
         );
 
-        if offset == 0 {
+        if !force_sequential && (offset == 0 || sidecar_path.exists()) {
             match try_segmented_download(
                 SegmentedDownloadContext {
                     client: &client,
@@ -1615,8 +1995,8 @@ async fn download_file_inner(
                     id: &id,
                     url: &url,
                     filename: &filename,
-                    directory: &directory,
                     path: &path,
+                    sidecar_path: &sidecar_path,
                 },
                 &mut control,
             )
@@ -1625,6 +2005,9 @@ async fn download_file_inner(
                 Ok(SegmentedAttempt::Completed(total)) => {
                     match finalize_file(&destination, &path).await {
                         Ok(()) => {
+                            if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
+                                eprintln!("{error}");
+                            }
                             publish_update!(
                                 &app,
                                 &manager,
@@ -1652,7 +2035,10 @@ async fn download_file_inner(
                     }
                     return;
                 }
-                Ok(SegmentedAttempt::Fallback) => {}
+                Ok(SegmentedAttempt::Fallback) => {
+                    force_sequential = true;
+                    continue;
+                }
                 Ok(SegmentedAttempt::Paused(progress, total, segment_validator)) => {
                     if segment_validator.is_some() {
                         validator = segment_validator.clone();
@@ -1684,6 +2070,9 @@ async fn download_file_inner(
                         )
                         .await;
                     } else {
+                        if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
+                            eprintln!("{error}");
+                        }
                         publish_update!(
                             &app,
                             &manager,
@@ -1737,6 +2126,9 @@ async fn download_file_inner(
                     if let Err(error) = remove_partial_file(&path).await {
                         finish_failed!(&app, &manager, &id, &filename, &path, offset, total_bytes, error).await;
                     } else {
+                        if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
+                            eprintln!("{error}");
+                        }
                         publish_update!(&app, &manager, &id, &filename, "cancelled", 0, total_bytes, None);
                     }
                     return;
@@ -1996,6 +2388,9 @@ async fn download_file_inner(
                 )
                 .await;
             } else {
+                if let Err(error) = remove_segment_sidecar(&sidecar_path).await {
+                    eprintln!("{error}");
+                }
                 publish_update!(
                     &app,
                     &manager,
@@ -2512,14 +2907,16 @@ fn set_max_concurrent_downloads(
 mod tests {
     use super::{
         Control, DownloadAdmission, DownloadContext, DownloadEntry, DownloadManager,
-        DownloadUpdate, PersistedDownload, PersistedSettings, SlotResult, UpdateSink,
-        acquire_download_slot, contiguous_segment_lengths, download_file_inner,
-        ensure_destination_available, filename_from_url, finalize_file, is_reserved_windows_name,
-        numbered_filename, parse_content_range, partial_path_for, persist_max_concurrent_downloads,
+        DownloadUpdate, PersistedDownload, PersistedSettings, SEGMENT_RESUME_VERSION,
+        SegmentPosition, SegmentResumeState, SlotResult, UpdateSink, acquire_download_slot,
+        download_file_inner, ensure_destination_available, filename_from_url, finalize_file,
+        is_reserved_windows_name, numbered_filename, parse_content_range, partial_path_for,
+        pause_active_downloads, persist_max_concurrent_downloads, persist_segment_resume_state,
         persist_snapshot, prepare_download_retry, read_max_concurrent_downloads,
-        read_persisted_queue, reconcile_persisted_status, restore_download_manager, segment_ranges,
-        valid_range_probe, valid_segment_response, validate_max_concurrent_downloads,
-        validate_transition, validators_compatible,
+        read_persisted_queue, read_segment_resume_state, reconcile_persisted_status,
+        restore_download_manager, segment_progress, segment_ranges, segment_sidecar_path,
+        valid_range_probe, valid_segment_response, valid_segment_resume_state,
+        validate_max_concurrent_downloads, validate_transition, validators_compatible,
     };
     use std::{
         io::{Read, Write},
@@ -2547,6 +2944,7 @@ mod tests {
     struct LocalHttpServer {
         url: String,
         range_requests: Arc<AtomicUsize>,
+        requested_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
         slow: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         server_thread: Option<JoinHandle<()>>,
@@ -2559,6 +2957,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let body = Arc::new(body);
             let range_requests = Arc::new(AtomicUsize::new(0));
+            let requested_ranges = Arc::new(Mutex::new(Vec::new()));
             let slow = Arc::new(AtomicBool::new(matches!(
                 behavior,
                 ServerBehavior::SlowRanges | ServerBehavior::SlowStreamingRanges
@@ -2567,6 +2966,7 @@ mod tests {
 
             let thread_body = body.clone();
             let thread_range_requests = range_requests.clone();
+            let thread_requested_ranges = requested_ranges.clone();
             let thread_slow = slow.clone();
             let thread_shutdown = shutdown.clone();
             let server_thread = thread::spawn(move || {
@@ -2575,6 +2975,7 @@ mod tests {
                         Ok((stream, _)) => {
                             let body = thread_body.clone();
                             let range_requests = thread_range_requests.clone();
+                            let requested_ranges = thread_requested_ranges.clone();
                             let slow = thread_slow.clone();
                             thread::spawn(move || {
                                 serve_download_request(
@@ -2582,6 +2983,7 @@ mod tests {
                                     body,
                                     behavior,
                                     range_requests,
+                                    requested_ranges,
                                     slow,
                                 );
                             });
@@ -2597,6 +2999,7 @@ mod tests {
             Self {
                 url: format!("http://{address}/payload.bin"),
                 range_requests,
+                requested_ranges,
                 slow,
                 shutdown,
                 server_thread: Some(server_thread),
@@ -2619,6 +3022,7 @@ mod tests {
         body: Arc<Vec<u8>>,
         behavior: ServerBehavior,
         range_requests: Arc<AtomicUsize>,
+        requested_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
         slow: Arc<AtomicBool>,
     ) {
         let _ = stream.set_nonblocking(false);
@@ -2656,6 +3060,7 @@ mod tests {
         });
         if range.is_some() {
             range_requests.fetch_add(1, Ordering::Relaxed);
+            requested_ranges.lock().unwrap().push(range.unwrap());
         }
         let is_probe = range == Some((0, 0));
         let ignores_range = behavior == ServerBehavior::IgnoresRanges;
@@ -2703,8 +3108,8 @@ mod tests {
                 if stream.write_all(body_chunk).is_err() {
                     return;
                 }
-                while slow.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(2));
+                if slow.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(100));
                 }
             }
             return;
@@ -2833,32 +3238,32 @@ mod tests {
         panic!("download did not reach status {status}");
     }
 
-    async fn wait_for_segment_file(test_download: &TestDownload, index: usize) -> u64 {
-        let segment_path = test_download
-            .directory
-            .join(format!(".{}.segments", test_download.id))
-            .join(index.to_string());
+    async fn wait_for_segment_checkpoint(test_download: &TestDownload) -> SegmentResumeState {
+        let sidecar = segment_sidecar_path(&test_download.final_path);
         for _ in 0..10_000 {
-            if let Ok(metadata) = std::fs::metadata(&segment_path) {
-                if metadata.len() > 0 {
-                    return metadata.len();
+            if let Ok(Some(state)) = read_segment_resume_state(&sidecar)
+                && segment_progress(&state) > 0
+            {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("no segmented progress was checkpointed");
+    }
+
+    async fn wait_for_paused_checkpoint(test_download: &TestDownload) -> SegmentResumeState {
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        for _ in 0..10_000 {
+            if let Ok(Some(state)) = read_segment_resume_state(&sidecar) {
+                let entries = test_download.manager.entries.lock().unwrap();
+                let entry = &entries[&test_download.id];
+                if entry.status == "paused" && entry.downloaded_bytes == segment_progress(&state) {
+                    return state;
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        panic!("segment {index} did not receive any bytes");
-    }
-
-    async fn wait_for_downloaded_bytes(test_download: &TestDownload, minimum: u64) {
-        for _ in 0..10_000 {
-            if test_download.manager.entries.lock().unwrap()[&test_download.id].downloaded_bytes
-                >= minimum
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        panic!("download did not publish at least {minimum} bytes");
+        panic!("paused download progress was not persisted consistently");
     }
 
     fn test_payload(length: usize) -> Vec<u8> {
@@ -2926,17 +3331,71 @@ mod tests {
     }
 
     #[test]
-    fn segmented_pause_prefix_stops_at_first_gap_and_keeps_partial_segment() {
-        let expected = [10, 10, 10, 10];
-        assert_eq!(
-            contiguous_segment_lengths(&expected, &[Some(10), Some(4), Some(10), Some(10)]),
-            vec![10, 4]
-        );
-        assert_eq!(
-            contiguous_segment_lengths(&expected, &[Some(10), None, Some(10), Some(10)]),
-            vec![10]
-        );
-        assert!(contiguous_segment_lengths(&expected, &[Some(11), Some(10)]).is_empty());
+    fn segmented_resume_progress_includes_every_saved_range() {
+        let state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: "http://127.0.0.1/file".to_string(),
+            final_url: "http://127.0.0.1/file".to_string(),
+            total_size: 40,
+            validator: None,
+            segments: vec![
+                SegmentPosition {
+                    start: 0,
+                    end: 9,
+                    position: 10,
+                },
+                SegmentPosition {
+                    start: 10,
+                    end: 19,
+                    position: 15,
+                },
+                SegmentPosition {
+                    start: 20,
+                    end: 29,
+                    position: 30,
+                },
+                SegmentPosition {
+                    start: 30,
+                    end: 39,
+                    position: 35,
+                },
+            ],
+        };
+        assert!(valid_segment_resume_state(&state));
+        assert_eq!(segment_progress(&state), 30);
+    }
+
+    #[tokio::test]
+    async fn segmented_resume_sidecar_is_atomically_replaced() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-sidecar-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("payload.bin");
+        let sidecar = segment_sidecar_path(&destination);
+        let mut state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: "http://127.0.0.1/payload.bin".to_string(),
+            final_url: "http://127.0.0.1/payload.bin".to_string(),
+            total_size: 20,
+            validator: Some("\"stable\"".to_string()),
+            segments: vec![SegmentPosition {
+                start: 0,
+                end: 19,
+                position: 0,
+            }],
+        };
+        persist_segment_resume_state(&sidecar, &state)
+            .await
+            .unwrap();
+        state.segments[0].position = 12;
+        persist_segment_resume_state(&sidecar, &state)
+            .await
+            .unwrap();
+
+        let restored = read_segment_resume_state(&sidecar).unwrap().unwrap();
+        assert_eq!(segment_progress(&restored), 12);
+        assert_eq!(restored.validator.as_deref(), Some("\"stable\""));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2982,6 +3441,21 @@ mod tests {
         assert!(validate_transition("queued", "queued").is_err());
         assert!(validate_transition("completed", "paused").is_err());
         assert!(validate_transition("cancelled", "downloading").is_err());
+    }
+
+    #[test]
+    fn shutdown_pauses_active_downloads_before_exit() {
+        let test_download = TestDownload::new();
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.control.send_replace(Control::Running);
+            entry.status = "downloading".to_string();
+        }
+
+        pause_active_downloads(&test_download.manager).unwrap();
+
+        assert!(*test_download.control_receiver.borrow() == Control::Paused);
     }
 
     #[test]
@@ -3205,6 +3679,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_queue_and_settings_are_migrated_to_versioned_formats() {
+        let directory =
+            std::env::temp_dir().join(format!("rustdload-migration-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let queue_file = directory.join("downloads.json");
+        let settings_file = directory.join("settings.json");
+        let backup_file = queue_file.with_extension("json.bak");
+        let record = persisted_download("paused", 7);
+
+        std::fs::write(&queue_file, serde_json::to_vec(&[&record]).unwrap()).unwrap();
+        assert_eq!(
+            read_persisted_queue(&queue_file, &backup_file).unwrap()[0].id,
+            record.id
+        );
+        persist_snapshot(&queue_file, std::slice::from_ref(&record)).unwrap();
+        let queue: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&queue_file).unwrap()).unwrap();
+        assert_eq!(queue["version"], super::PERSISTED_FORMAT_VERSION);
+
+        std::fs::write(&settings_file, br#"{"maxConcurrentDownloads":5}"#).unwrap();
+        assert_eq!(read_max_concurrent_downloads(&settings_file).unwrap(), 5);
+        persist_max_concurrent_downloads(&settings_file, 5).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_file).unwrap()).unwrap();
+        assert_eq!(settings["version"], super::PERSISTED_FORMAT_VERSION);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn concurrent_download_limit_validates_bounds() {
         assert_eq!(validate_max_concurrent_downloads(1).unwrap(), 1);
         assert_eq!(validate_max_concurrent_downloads(10).unwrap(), 10);
@@ -3230,6 +3733,7 @@ mod tests {
         std::fs::write(
             &backup_file,
             serde_json::to_vec(&PersistedSettings {
+                version: super::PERSISTED_FORMAT_VERSION,
                 max_concurrent_downloads: 5,
             })
             .unwrap(),
@@ -3392,7 +3896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_http_range_server_downloads_and_assembles_exact_bytes() {
+    async fn local_http_range_server_writes_exact_bytes_to_preallocated_file() {
         let _guard = HTTP_TEST_LOCK.lock().unwrap();
         let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 37);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
@@ -3460,24 +3964,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_http_segmented_pause_preserves_contiguous_progress_and_resumes() {
+    async fn local_http_segmented_pause_preserves_all_progress_and_resumes() {
         let _guard = HTTP_TEST_LOCK.lock().unwrap();
         let payload = test_payload(8 * 1024 * 1024);
         let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowStreamingRanges);
         let test_download = TestDownload::new();
         let task = start_test_download(&server, &test_download);
 
-        let first_segment_bytes = wait_for_segment_file(&test_download, 0).await;
-        assert!(first_segment_bytes > 0);
+        let checkpoint = wait_for_segment_checkpoint(&test_download).await;
+        assert!(segment_progress(&checkpoint) > 0);
         test_download.control_sender.send_replace(Control::Paused);
-        wait_for_downloaded_bytes(&test_download, first_segment_bytes).await;
-        wait_for_status(&test_download, "paused").await;
+        let paused_state = wait_for_paused_checkpoint(&test_download).await;
 
-        let paused_bytes = std::fs::metadata(&test_download.partial_path)
-            .unwrap()
-            .len();
-        assert!(paused_bytes >= first_segment_bytes);
-        assert!(paused_bytes < payload.len() as u64);
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        let paused_progress = segment_progress(&paused_state);
+        assert!(paused_progress > 0);
+        assert!(paused_progress < payload.len() as u64);
+        assert!(
+            paused_state
+                .segments
+                .iter()
+                .any(|segment| segment.position > segment.start)
+        );
+        assert_eq!(
+            std::fs::metadata(&test_download.partial_path)
+                .unwrap()
+                .len(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            test_download.manager.entries.lock().unwrap()[&test_download.id].downloaded_bytes,
+            paused_progress
+        );
         assert_eq!(
             test_download.manager.entries.lock().unwrap()[&test_download.id].validator,
             Some("\"stable\"".to_string())
@@ -3489,6 +4007,169 @@ mod tests {
 
         assert_eq!(test_download.status(), "completed");
         assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_segmented_download_restores_sidecar_and_only_requests_missing_ranges() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let payload = test_payload(8 * 1024 * 1024);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SlowStreamingRanges);
+        let test_download = TestDownload::new();
+        let task = start_test_download(&server, &test_download);
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        let saved_state = wait_for_segment_checkpoint(&test_download).await;
+        assert!(segment_progress(&saved_state) > 0);
+
+        let request_count = server.range_requests.load(Ordering::Acquire);
+        task.abort();
+        let _ = task.await;
+        server.slow.store(false, Ordering::Release);
+
+        let persistence_file = test_download.directory.join("downloads.json");
+        let download_dir = test_download.directory.join("downloads");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let mut record = persisted_download("downloading", 0);
+        record.id = test_download.id.clone();
+        record.url = server.url.clone();
+        record.filename = "payload.bin".to_string();
+        record.destination = Some(test_download.final_path.to_string_lossy().into_owned());
+        persist_snapshot(&persistence_file, &[record]).unwrap();
+
+        let (manager, recovered) =
+            restore_download_manager(persistence_file, &download_dir).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, "paused");
+        assert_eq!(
+            recovered[0].downloaded_bytes,
+            segment_progress(&saved_state)
+        );
+        let receiver = {
+            let mut entries = manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            assert_eq!(entry.status, "paused");
+            entry.control.send_replace(Control::Running);
+            entry.control.subscribe()
+        };
+        let restored_manager = manager.clone();
+        let app: Arc<dyn UpdateSink> = Arc::new(TestUpdateSink);
+        download_file_inner(
+            app,
+            manager,
+            DownloadContext {
+                id: test_download.id.clone(),
+                url: server.url.clone(),
+                filename: "payload.bin".to_string(),
+                destination: test_download.final_path.clone(),
+                partial_path: test_download.partial_path.clone(),
+            },
+            receiver,
+        )
+        .await;
+
+        assert_eq!(
+            restored_manager.entries.lock().unwrap()[&test_download.id].status,
+            "completed",
+            "download error: {:?}",
+            restored_manager.entries.lock().unwrap()[&test_download.id].error
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(!sidecar.exists());
+        let resumed_ranges = server.requested_ranges.lock().unwrap();
+        let resumed_ranges = &resumed_ranges[request_count..];
+        for segment in &saved_state.segments {
+            if segment.position <= segment.end {
+                assert!(
+                    resumed_ranges.contains(&(segment.position, segment.end)),
+                    "missing resumed range {}-{}",
+                    segment.position,
+                    segment.end
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn segmented_resume_restarts_from_zero_when_validator_changes() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap();
+        let payload = test_payload(super::MIN_SEGMENTED_DOWNLOAD_SIZE as usize + 19);
+        let server = LocalHttpServer::start(payload.clone(), ServerBehavior::SupportsRanges);
+        let test_download = TestDownload::new();
+        let sidecar = segment_sidecar_path(&test_download.final_path);
+        let ranges = segment_ranges(payload.len() as u64, super::MAX_SEGMENTS_PER_DOWNLOAD);
+        let old_state = SegmentResumeState {
+            version: SEGMENT_RESUME_VERSION,
+            url: server.url.clone(),
+            final_url: server.url.clone(),
+            total_size: payload.len() as u64,
+            validator: Some("\"old-validator\"".to_string()),
+            segments: ranges
+                .iter()
+                .enumerate()
+                .map(|(index, (start, end))| SegmentPosition {
+                    start: *start,
+                    end: *end,
+                    position: if index == 0 { *end + 1 } else { *start },
+                })
+                .collect(),
+        };
+        std::fs::write(&test_download.partial_path, vec![0xA5; payload.len()]).unwrap();
+        persist_segment_resume_state(&sidecar, &old_state)
+            .await
+            .unwrap();
+        assert!(sidecar.exists());
+        assert_eq!(
+            read_segment_resume_state(&sidecar)
+                .unwrap()
+                .unwrap()
+                .validator,
+            old_state.validator
+        );
+        {
+            let mut entries = test_download.manager.entries.lock().unwrap();
+            let entry = entries.get_mut(&test_download.id).unwrap();
+            entry.url = server.url.clone();
+            entry.status = "paused".to_string();
+            entry.total_bytes = Some(payload.len() as u64);
+            entry.validator = old_state.validator.clone();
+            entry.control.send_replace(Control::Running);
+        }
+        let mut control_receiver = test_download.control_receiver.clone();
+        let _ = control_receiver.borrow_and_update();
+
+        let app: Arc<dyn UpdateSink> = Arc::new(TestUpdateSink);
+        download_file_inner(
+            app,
+            test_download.manager.clone(),
+            DownloadContext {
+                id: test_download.id.clone(),
+                url: server.url.clone(),
+                filename: "payload.bin".to_string(),
+                destination: test_download.final_path.clone(),
+                partial_path: test_download.partial_path.clone(),
+            },
+            control_receiver,
+        )
+        .await;
+
+        assert_eq!(
+            test_download.status(),
+            "completed",
+            "download error: {:?}; ranges: {:?}",
+            test_download.manager.entries.lock().unwrap()[&test_download.id].error,
+            server.requested_ranges.lock().unwrap()
+        );
+        assert_eq!(std::fs::read(&test_download.final_path).unwrap(), payload);
+        assert!(!sidecar.exists());
+        let requests = server.requested_ranges.lock().unwrap();
+        for expected in ranges {
+            assert!(
+                requests.contains(&expected),
+                "restart did not request the full range {}-{}",
+                expected.0,
+                expected.1
+            );
+        }
     }
 
     #[tokio::test]
@@ -3514,7 +4195,9 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let exit_started = Arc::new(AtomicBool::new(false));
+    let exit_started_for_run = exit_started.clone();
+    let app = tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
@@ -3570,6 +4253,50 @@ pub fn run() {
             set_max_concurrent_downloads
         ])
         .plugin(tauri_plugin_dialog::init())
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    app.run(move |app_handle, event| {
+        if let RunEvent::ExitRequested { api, .. } = event {
+            api.prevent_exit();
+            if exit_started_for_run.swap(true, Ordering::AcqRel) {
+                return;
+            }
+
+            let Some(manager_state) = app_handle.try_state::<DownloadManager>() else {
+                app_handle.exit(0);
+                return;
+            };
+            let manager = manager_state.inner().clone();
+            if let Err(error) = pause_active_downloads(&manager) {
+                eprintln!("{error}");
+            }
+            let exit_app = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let active = match manager.entries.lock() {
+                        Ok(entries) => entries.values().any(|entry| entry.status == "downloading"),
+                        Err(_) => {
+                            eprintln!("Download state is unavailable while waiting for shutdown.");
+                            false
+                        }
+                    };
+                    if !active {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "Timed out waiting for active downloads to checkpoint before shutdown."
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if let Err(error) = manager.persist() {
+                    eprintln!("{error}");
+                }
+                exit_app.exit(0);
+            });
+        }
+    });
 }
